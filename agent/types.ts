@@ -40,7 +40,16 @@ export type Trade = {
 };
 
 /** Fast price snapshot (DexScreener), refreshed every ~2 s between tape polls. */
-export type Quote = { at: number; priceSol: number; priceUsd: number; liquidityUsd: number; mcapUsd: number };
+export type Quote = {
+  at: number;
+  priceSol: number;
+  priceUsd: number;
+  liquidityUsd: number;
+  mcapUsd: number;
+  /** Pool reserves (PumpSwap); 0 on the curve, where reserves follow from the price. */
+  reserveTokens: number;
+  reserveSol: number;
+};
 
 export type Holder = { owner: string; pct: number; insider: boolean };
 
@@ -108,13 +117,28 @@ export type Features = {
   minSinceAth: number;
   /** Bounce off the lowest price since the ATH. */
   bounceFromLow: number;
+  /** Lowest price since the ATH, and how long ago it printed. */
+  lowSol: number;
+  lowAgeMin: number;
+  /** Deepest drawdown from the ATH (at the low). */
+  maxDrawdown: number;
+  /** Minutes the price has held within 30% above the post-ATH low. */
+  baseMin: number;
   range10m: number;
+  hi10Sol: number;
+  lo10Sol: number;
+  /** Largest net seller since the ATH, as % of supply, and whether they sold in the last minute. */
+  topSellerPct: number;
+  topSellerActive: boolean;
+  /** Share of 5m buys that repeat the same wallet + size (bump/volume bots). */
+  repeatBuyShare: number;
   higherLow: boolean;
   curveProgress: number | null;
   flow15s: Flow;
   flow60s: Flow;
   flow5m: Flow;
-  cohorts: { dev: Cohort; snipers: Cohort; bundles: Cohort; early: Cohort };
+  /** insiders = dev + snipers + bundles combined. */
+  cohorts: { dev: Cohort; snipers: Cohort; bundles: Cohort; early: Cohort; insiders: Cohort };
   /** 0–1: selling has slowed while price stopped making new lows (launch cohorts when known, else all sellers). */
   exhaustion: number | null;
   exhaustionBasis: "cohorts" | "all-sellers";

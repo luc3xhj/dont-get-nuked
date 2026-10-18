@@ -64,6 +64,10 @@ export function runScreens(s: CoinState): ScreenResult[] {
   const rt = f.flow5m.roundTripShare;
   add("wash", "Wash-like flow", rt >= t.washShareWarn ? "warn" : "ok", `${(rt * 100).toFixed(0)}% of 5m volume from wallets that bought and sold`);
 
+  const rb = f.repeatBuyShare;
+  if (f.flow5m.buys >= 10)
+    add("bots", "Bump bots", rb >= 0.4 ? "warn" : "ok", `${(rb * 100).toFixed(0)}% of 5m buys repeat the same wallet and size`);
+
   // Socials
   const links = [s.coin.socials.twitter, s.coin.socials.telegram, s.coin.socials.website].filter(Boolean).length;
   if (!links) add("socials", "Socials", "warn", "No social links");

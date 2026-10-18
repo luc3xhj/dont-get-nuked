@@ -26,6 +26,8 @@ export const CONFIG = {
      */
     minPollMs: 4_000,
     maxPollMs: 30_000,
+    /** Held and armed coins are polled at least this often. */
+    priorityPollMs: 10_000,
     pageSize: 100,
     /** Backfill cap (pages) when a coin first becomes hot. Migrated coins skip backfill. */
     maxBackfillPages: 4,

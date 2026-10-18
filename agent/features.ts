@@ -157,6 +157,38 @@ export function computeFeatures(s: CoinState, now = Date.now()): Features | null
   // No trades at all in the last minute is a dead coin, not an exhausted seller.
   const idle = !trades.some((t) => t.ts >= now - 60_000);
 
+  // ---- dump anatomy: who sold from the top, and is the base holding? ----
+  const soldSinceAth = new Map<string, number>();
+  for (let i = athIdx; i < trades.length; i++) {
+    const t = trades[i];
+    soldSinceAth.set(t.wallet, (soldSinceAth.get(t.wallet) ?? 0) + (t.side === "sell" ? t.tokens : -t.tokens));
+  }
+  let topSeller: string | null = null;
+  let topSold = 0;
+  for (const [w, v] of soldSinceAth)
+    if (v > topSold) {
+      topSold = v;
+      topSeller = w;
+    }
+  const topSellerActive = !!topSeller && trades.some((t) => t.wallet === topSeller && t.side === "sell" && t.ts >= now - 60_000);
+  // Minutes the price has stayed within 30% above the post-ATH low (a base forming).
+  let baseSince = now;
+  for (let i = trades.length - 1; i > lowIdx; i--) {
+    if (trades[i].priceSol > lowAfterAth * 1.3) break;
+    baseSince = trades[i].ts;
+  }
+  if (priceSol > lowAfterAth * 1.3) baseSince = now;
+
+  // ---- bump bots: the same wallet buying the same size over and over ----
+  const buys5m = trades.filter((t) => t.side === "buy" && t.ts >= now - 300_000);
+  const sizeCount = new Map<string, number>();
+  for (const t of buys5m) {
+    const k = `${t.wallet}:${t.sol.toFixed(3)}`;
+    sizeCount.set(k, (sizeCount.get(k) ?? 0) + 1);
+  }
+  let repeats = 0;
+  for (const t of buys5m) if ((sizeCount.get(`${t.wallet}:${t.sol.toFixed(3)}`) ?? 0) >= 2) repeats++;
+
   return {
     at: now,
     ageMin: (now - (s.coin.createdAt || trades[0].ts)) / 60_000,
@@ -167,7 +199,16 @@ export function computeFeatures(s: CoinState, now = Date.now()): Features | null
     drawdown: ath ? 1 - priceSol / ath : 0,
     minSinceAth: (now - trades[athIdx].ts) / 60_000,
     bounceFromLow: lowAfterAth ? priceSol / lowAfterAth - 1 : 0,
+    lowSol: lowAfterAth,
+    lowAgeMin: (now - trades[lowIdx].ts) / 60_000,
+    maxDrawdown: ath ? 1 - lowAfterAth / ath : 0,
+    baseMin: (now - baseSince) / 60_000,
     range10m: lo10 ? hi10 / lo10 - 1 : 0,
+    hi10Sol: hi10,
+    lo10Sol: lo10,
+    topSellerPct: (topSold / CONFIG.totalSupply) * 100,
+    topSellerActive,
+    repeatBuyShare: buys5m.length ? repeats / buys5m.length : 0,
     higherLow,
     curveProgress: s.coin.curveProgress,
     flow15s: flow(trades, now - 15_000, now, firstSeen),
@@ -178,6 +219,7 @@ export function computeFeatures(s: CoinState, now = Date.now()): Features | null
       snipers: cohort(trades, snipers, now),
       bundles: cohort(trades, bundles, now),
       early: cohort(trades, early, now),
+      insiders: cohort(trades, new Set([...dev, ...snipers, ...bundles]), now),
     },
     exhaustion: idle ? null : exhaustion,
     exhaustionBasis: basis,

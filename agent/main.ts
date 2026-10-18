@@ -7,11 +7,16 @@ import { journal, prune } from "./db";
 import { computeFeatures } from "./features";
 import { httpStats } from "./http";
 import { runScreens, verdict } from "./screens";
-import { coins, laneOf, quoteTick, refreshUniverse, reportsTick, restore, stats, tapeTick, type CoinState } from "./state";
+import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio } from "./portfolio";
+import { evaluateSetups } from "./setups";
+import { coins, devHistory, laneOf, pinned, quoteTick, refreshUniverse, reportsTick, restore, stats, tapeTick, type CoinState } from "./state";
 
 function evaluate(s: CoinState) {
   s.features = computeFeatures(s);
   s.screens = runScreens(s);
+  s.setups = evaluateSetups(s, devHistory(s.coin.creator, s.coin.mint));
+  const fired = s.setups.filter((x) => x.status === "fire");
+  if (fired.length) onSignals(s, fired);
 }
 
 function loop(name: string, everyMs: number, fn: () => Promise<void>) {
@@ -50,6 +55,8 @@ function summary(s: CoinState) {
     features: f,
     holders: s.holders && { at: s.holders.at, top10ExPoolPct: s.holders.top10ExPoolPct, totalHolders: s.holders.totalHolders, insidersDetected: s.holders.insidersDetected },
     social: s.social,
+    setups: s.setups,
+    held: pinned.has(s.coin.mint),
     curveProgress: s.coin.curveProgress,
     mcapUsd: s.coin.mcapUsd,
   };
@@ -62,6 +69,13 @@ function send(res: import("node:http").ServerResponse, status: number, body: unk
 
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
+  if (req.method === "POST" && url.pathname === "/api/control") {
+    const action = url.searchParams.get("action");
+    if (action !== "pause" && action !== "resume") return send(res, 400, { error: "action must be pause or resume" });
+    control(action);
+    return send(res, 200, { ok: true });
+  }
+  if (url.pathname === "/api/portfolio") return send(res, 200, portfolioReport());
   if (url.pathname === "/api/state") {
     const hot = [...coins.values()].filter((s) => s.hot).map(summary);
     return send(res, 200, {
@@ -84,6 +98,8 @@ const server = createServer((req, res) => {
 // ---------- start ----------
 
 restore();
+restorePortfolio();
+for (const m of heldMints()) pinned.add(m);
 server.listen(CONFIG.port, "127.0.0.1", () => console.log(`agent API on http://127.0.0.1:${CONFIG.port}`));
 journal("start", null, { config: CONFIG });
 
@@ -94,6 +110,11 @@ loop("quotes", 2_000, quoteTick);
 // Re-evaluate every hot coin each second so time-based features (windows, exhaustion) stay current between trades.
 loop("evaluate", 1_000, async () => {
   for (const s of coins.values()) if (s.hot) evaluate(s);
+});
+loop("portfolio", 1_000, async () => {
+  portfolioTick();
+  pinned.clear();
+  for (const m of heldMints()) pinned.add(m);
 });
 loop("prune", 10 * 60_000, async () => {
   prune(new Set([...coins.values()].filter((s) => s.hot).map((s) => s.coin.mint)), 24 * 3600_000);

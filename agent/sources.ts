@@ -221,6 +221,8 @@ export async function dsQuotes(addresses: string[]): Promise<Record<string, Quot
       priceUsd: num(p.priceUsd),
       liquidityUsd: num((p.liquidity as { usd?: number } | undefined)?.usd),
       mcapUsd: num(p.marketCap) || num(p.fdv),
+      reserveTokens: num((p.liquidity as { base?: number } | undefined)?.base),
+      reserveSol: num((p.liquidity as { quote?: number } | undefined)?.quote),
     };
   }
   return out;

@@ -1,9 +1,10 @@
 // In-memory market state: the coin universe, which coins are "hot" (deep-watched),
 // and each hot coin's trade tape, holder and social reports.
 import { CONFIG } from "./config";
-import { journal, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
+import { db, journal, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
 import { budget } from "./http";
 import { dsQuotes, GT_URL, gtTrades, holderReport, pumpList, socialReport, tradePage } from "./sources";
+import type { SetupEval } from "./setups";
 import type { Coin, Features, HolderReport, Quote, ScreenResult, SocialReport, Trade } from "./types";
 
 export type CoinState = {
@@ -24,9 +25,14 @@ export type CoinState = {
   quote: Quote | null;
   features: Features | null;
   screens: ScreenResult[];
+  setups: SetupEval[];
 };
 
 export const coins = new Map<string, CoinState>();
+/** Mints that must stay deep-watched (open positions), set by the portfolio. */
+export const pinned = new Set<string>();
+/** Held or armed coins get their tapes polled first. */
+const isPriority = (s: CoinState) => pinned.has(s.coin.mint) || s.setups.length > 0;
 export const stats = { listRefreshes: 0, listErrors: 0, tapePolls: 0, tapeErrors: 0, tradesIngested: 0, startedAt: Date.now() };
 
 function stateFor(coin: Coin): CoinState {
@@ -48,6 +54,7 @@ function stateFor(coin: Coin): CoinState {
       quote: null,
       features: null,
       screens: [],
+      setups: [],
     };
     coins.set(coin.mint, s);
   } else {
@@ -116,7 +123,7 @@ export async function refreshUniverse() {
     saveCoin(s.coin);
   }
   for (const [mint, s] of coins) {
-    if (now - s.coin.createdAt > CONFIG.universe.maxAgeMs && !s.hot) coins.delete(mint);
+    if (now - s.coin.createdAt > CONFIG.universe.maxAgeMs && !s.hot && !pinned.has(mint)) coins.delete(mint);
     else s.score = attention(s.coin, now);
   }
   selectHot(now);
@@ -127,7 +134,8 @@ function selectHot(now: number) {
   // Keep recently promoted coins that are still trading and still in a pool.
   const keep = all.filter(
     (s) =>
-      s.hot && laneOf(s.coin, now) && now - (s.hotSince ?? 0) < CONFIG.universe.minHotMs && now - lastActivity(s) < CONFIG.universe.idleMs
+      pinned.has(s.coin.mint) ||
+      (s.hot && laneOf(s.coin, now) && now - (s.hotSince ?? 0) < CONFIG.universe.minHotMs && now - lastActivity(s) < CONFIG.universe.idleMs)
   );
   const hot = new Set(keep);
   const ranked = all.filter((s) => !hot.has(s) && s.score > -Infinity).sort((a, b) => liveScore(b) - liveScore(a));
@@ -229,7 +237,9 @@ function pollInterval(s: CoinState, now: number) {
   const perMs = recent / 120_000;
   // Pages hold 100 (pump.fun) to 300 (GeckoTerminal) trades; plan for the smaller one.
   const fill = perMs > 0 ? (CONFIG.tape.pageSize * 0.6) / perMs : Infinity;
-  return Math.max(CONFIG.tape.minPollMs, Math.min(CONFIG.tape.maxPollMs, fill));
+  // Held and armed coins need fresh order flow for triggers and thesis exits.
+  const cap = isPriority(s) ? CONFIG.tape.priorityPollMs : CONFIG.tape.maxPollMs;
+  return Math.max(CONFIG.tape.minPollMs, Math.min(cap, fill));
 }
 
 /** Poll the most overdue hot coins that the request budget allows. */
@@ -237,7 +247,7 @@ export async function tapeTick(onUpdate: (s: CoinState) => void) {
   const now = Date.now();
   const due = [...coins.values()]
     .filter((s) => s.hot && !s.backfilling && s.nextPollAt <= now)
-    .sort((a, b) => a.nextPollAt - b.nextPollAt);
+    .sort((a, b) => Number(isPriority(b)) - Number(isPriority(a)) || a.nextPollAt - b.nextPollAt);
   // Live polls ride on GeckoTerminal; pump.fun's tight budget is kept for launch backfills,
   // which run in the background so a slow backfill never stalls everyone else's polls.
   const backfilling = [...coins.values()].filter((s) => s.backfilling).length;
@@ -305,4 +315,19 @@ export async function quoteTick() {
     const q = quotes[pairAddress(s.coin)];
     if (q) s.quote = q;
   }
+}
+
+// ---------- creator history (observed only) ----------
+
+const devCache = new Map<string, { at: number; coins: number; successes: number }>();
+
+/** Prior coins by this creator that we have seen, and how many did well (graduated or ATH ≥ $100k). */
+export function devHistory(creator: string, excludeMint: string) {
+  const hit = devCache.get(creator);
+  if (hit && Date.now() - hit.at < 5 * 60_000) return hit;
+  const rows = db.prepare("SELECT data FROM coins WHERE json_extract(data, '$.creator') = ?").all(creator) as { data: string }[];
+  const prior = rows.map((r) => JSON.parse(r.data) as Coin).filter((c) => c.mint !== excludeMint);
+  const out = { at: Date.now(), coins: prior.length, successes: prior.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length };
+  devCache.set(creator, out);
+  return out;
 }
