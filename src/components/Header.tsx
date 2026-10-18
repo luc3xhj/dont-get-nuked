@@ -26,6 +26,7 @@ export default function Header() {
   const nav = [
     { href: "/", label: "Discover" },
     { href: "/portfolio", label: "Portfolio" },
+    { href: "/agent", label: "Agent" },
   ];
 
   return (
