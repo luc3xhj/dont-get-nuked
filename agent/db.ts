@@ -107,5 +107,6 @@ export function prune(keepMints: Set<string>, olderThanMs: number) {
   const cutoff = Date.now() - olderThanMs;
   const stale = (db.prepare("SELECT DISTINCT mint FROM trades WHERE ts < ?").all(cutoff) as { mint: string }[]).map((r) => r.mint);
   for (const mint of stale) if (!keepMints.has(mint)) db.prepare("DELETE FROM trades WHERE mint = ?").run(mint);
-  db.prepare("DELETE FROM coins WHERE updated_at < ?").run(cutoff);
+  // Keep coins the wallet has traded, so their pages and history stay readable.
+  db.prepare("DELETE FROM coins WHERE updated_at < ? AND mint NOT IN (SELECT json_extract(data, '$.mint') FROM closed)").run(cutoff);
 }

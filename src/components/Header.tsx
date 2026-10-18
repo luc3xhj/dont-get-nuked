@@ -2,32 +2,23 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { usePairs, useSolPrice } from "@/lib/hooks";
-import { poolFor, quoteSell } from "@/lib/amm";
-import { fmtCompact, fmtPct, fmtSol, pnlColor } from "@/lib/format";
-import { useWallet } from "@/lib/wallet";
+import { fmtCompact, pnlColor } from "@/lib/format";
+import { usePolling, useSolPrice } from "@/lib/hooks";
+
+type Wallet = { equity: number; pnlSol: number; todayPnlSol: number; startCash: number; open: number; paused: string | null; cooldownUntil: number };
+
+const NAV = [
+  { href: "/", label: "Dashboard" },
+  { href: "/market", label: "Market" },
+  { href: "/performance", label: "Performance" },
+];
 
 export default function Header() {
   const path = usePathname();
-  const { state, hydrated } = useWallet();
   const solUsd = useSolPrice();
-  const { pairs } = usePairs(Object.keys(state.positions), 10_000);
-
-  // Net worth = SOL + what every bag would actually fetch if sold right now.
-  let holdingsSol = 0;
-  for (const pos of Object.values(state.positions)) {
-    const pair = pairs[pos.pairAddress];
-    const pool = pair && poolFor(pair, solUsd);
-    holdingsSol += pool ? quoteSell(pool, pos.tokens).solOut : pos.costSol;
-  }
-  const equity = state.sol + holdingsSol;
-  const pnlPct = ((equity - state.startSol) / state.startSol) * 100;
-
-  const nav = [
-    { href: "/", label: "Discover" },
-    { href: "/portfolio", label: "Portfolio" },
-    { href: "/agent", label: "Agent" },
-  ];
+  const { data: w, error } = usePolling<Wallet>("/api/agent/wallet", 3_000);
+  const status = error ? "offline" : !w ? "connecting" : w.paused ? "paused" : w.cooldownUntil > Date.now() ? "cooling down" : "trading";
+  const dot = status === "trading" ? "bg-emerald-500 animate-pulse" : status === "offline" ? "bg-rose-500" : "bg-amber-400";
 
   return (
     <header className="sticky top-0 z-20 border-b border-zinc-800 bg-zinc-950/90 backdrop-blur">
@@ -38,8 +29,8 @@ export default function Header() {
           <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-400">paper</span>
         </Link>
         <nav className="flex gap-1">
-          {nav.map((n) => {
-            const active = n.href === "/" ? path === "/" || path.startsWith("/coin") : path.startsWith(n.href);
+          {NAV.map((n) => {
+            const active = n.href === "/" ? path === "/" : path.startsWith(n.href) || (n.href === "/market" && path.startsWith("/coin"));
             return (
               <Link
                 key={n.href}
@@ -52,20 +43,19 @@ export default function Header() {
           })}
         </nav>
         <div className="ml-auto flex items-center gap-5 text-sm">
+          <span className="flex items-center gap-1.5 text-xs text-zinc-400" title={w?.paused ?? error ?? ""}>
+            <span className={`h-2 w-2 rounded-full ${dot}`} /> Agent {status}
+          </span>
           <div className="text-right">
-            <div className="text-[11px] uppercase text-zinc-500">Cash</div>
-            <div className="num">{hydrated ? fmtSol(state.sol) : "…"}</div>
-          </div>
-          <div className="text-right">
-            <div className="text-[11px] uppercase text-zinc-500">Net worth</div>
+            <div className="text-[11px] uppercase text-zinc-500">Wallet</div>
             <div className="num">
-              {hydrated ? fmtSol(equity) : "…"}
-              {solUsd > 0 && <span className="ml-1 text-zinc-500">{fmtCompact(equity * solUsd)}</span>}
+              {w ? `${w.equity.toFixed(3)} SOL` : "…"}
+              {w && solUsd > 0 && <span className="ml-1 text-zinc-500">{fmtCompact(w.equity * solUsd)}</span>}
             </div>
           </div>
           <div className="text-right">
             <div className="text-[11px] uppercase text-zinc-500">All-time</div>
-            <div className={`num ${pnlColor(pnlPct)}`}>{hydrated ? fmtPct(pnlPct) : "…"}</div>
+            <div className={`num ${pnlColor(w?.pnlSol ?? 0)}`}>{w ? `${((w.pnlSol / w.startCash) * 100).toFixed(2)}%` : "…"}</div>
           </div>
         </div>
       </div>

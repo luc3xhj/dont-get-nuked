@@ -655,6 +655,21 @@ export function portfolioReport() {
   };
 }
 
+/** The agent wallet at a glance (header, dashboard). */
+export function walletSummary() {
+  const a = accounts.get("agent")!;
+  const e = equityOf("agent");
+  return {
+    ...e,
+    startCash: RISK.startCash,
+    pnlSol: e.equity - RISK.startCash,
+    todayPnlSol: e.equity - a.dayStartEquity,
+    open: [...positions.values()].filter((p) => p.account === "agent").length,
+    paused: a.paused,
+    cooldownUntil: a.cooldownUntil,
+  };
+}
+
 export function control(action: "pause" | "resume") {
   const a = accounts.get("agent")!;
   if (action === "pause") a.paused = "Paused manually";

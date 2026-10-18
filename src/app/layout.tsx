@@ -1,9 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import Header from "@/components/Header";
-import OrderEngine from "@/components/OrderEngine";
-import Toaster from "@/components/Toaster";
-import { WalletProvider } from "@/lib/wallet";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -18,7 +15,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Don't Get Nuked",
-  description: "Paper-trade Solana meme coins with live market data and a simulated wallet.",
+  description: "An autonomous agent paper-trading live Solana meme coins with a simulated wallet.",
 };
 
 export default function RootLayout({
@@ -29,12 +26,8 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased`}>
-        <WalletProvider>
-          <OrderEngine />
-          <Header />
-          <main className="mx-auto max-w-7xl px-4 py-6">{children}</main>
-          <Toaster />
-        </WalletProvider>
+        <Header />
+        <main className="mx-auto max-w-7xl px-4 py-6">{children}</main>
       </body>
     </html>
   );

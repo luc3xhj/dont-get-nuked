@@ -1,7 +1,9 @@
 // Agent worker: runs continuously, independent of the browser.
 //   npm run agent
-// Phase 1: universe, live trade tapes, holders/socials, features, screens, and a local JSON API.
+// Watches live pump.fun coins, detects setups, consults the analyst, and paper-trades one wallet
+// (plus two background benchmarks), exposing everything through a local JSON API.
 import { createServer } from "node:http";
+import { activity, agentFills, storedCoin } from "./activity";
 import { CONFIG } from "./config";
 import { journal, prune } from "./db";
 import { computeFeatures } from "./features";
@@ -9,14 +11,24 @@ import { httpStats } from "./http";
 import { runScreens, verdict } from "./screens";
 import { ANALYST, analystHealth, analystTick } from "./analyst";
 import { tregHealth } from "./research";
-import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio } from "./portfolio";
+import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio, walletSummary } from "./portfolio";
 import { evaluateSetups } from "./setups";
-import { coins, devHistory, laneOf, pinned, quoteTick, refreshUniverse, reportsTick, restore, stats, tapeTick, type CoinState } from "./state";
+import { coins, devHistory, laneOf, pairAddress, pinned, quoteTick, refreshUniverse, reportsTick, restore, stats, tapeTick, type CoinState } from "./state";
+
+const lastArmed = new Map<string, number>();
 
 function evaluate(s: CoinState) {
   s.features = computeFeatures(s);
   s.screens = runScreens(s);
   s.setups = evaluateSetups(s, devHistory(s.coin.creator, s.coin.mint));
+  // Note when a setup first arms (once per coin+setup per 10 minutes) for the activity feed.
+  for (const x of s.setups) {
+    const key = `${s.coin.mint}:${x.setup}`;
+    if (x.status === "armed" && Date.now() - (lastArmed.get(key) ?? 0) > 10 * 60_000) {
+      lastArmed.set(key, Date.now());
+      journal("armed", s.coin.mint, { setup: x.setup, passed: x.trigger.filter((k) => k.ok).length, total: x.trigger.length });
+    }
+  }
   const fired = s.setups.filter((x) => x.status === "fire");
   if (fired.length) onSignals(s, fired);
 }
@@ -60,6 +72,8 @@ function summary(s: CoinState) {
     setups: s.setups,
     analysis: s.analysis,
     held: pinned.has(s.coin.mint),
+    pairAddress: pairAddress(s.coin),
+    quote: s.quote,
     curveProgress: s.coin.curveProgress,
     mcapUsd: s.coin.mcapUsd,
   };
@@ -79,6 +93,7 @@ const server = createServer((req, res) => {
     return send(res, 200, { ok: true });
   }
   if (url.pathname === "/api/portfolio") return send(res, 200, portfolioReport());
+  if (url.pathname === "/api/wallet") return send(res, 200, walletSummary());
   if (url.pathname === "/api/state") {
     const hot = [...coins.values()].filter((s) => s.hot).map(summary);
     return send(res, 200, {
@@ -91,11 +106,21 @@ const server = createServer((req, res) => {
       hot,
     });
   }
+  if (url.pathname === "/api/activity") {
+    const before = Number(url.searchParams.get("before")) || undefined;
+    const mint = url.searchParams.get("mint");
+    return send(res, 200, activity(Math.min(200, Number(url.searchParams.get("limit")) || 60), before, mint && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) ? mint : undefined));
+  }
   const m = url.pathname.match(/^\/api\/coin\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (m) {
-    const s = coins.get(m[1]);
-    if (!s) return send(res, 404, { error: "not tracked" });
-    return send(res, 200, { ...summary(s), holdersReport: s.holders, recentTrades: s.trades.slice(-60).reverse() });
+    const mint = m[1];
+    const fills = agentFills(mint);
+    const s = coins.get(mint);
+    if (s) return send(res, 200, { ...summary(s), tracked: true, holdersReport: s.holders, recentTrades: s.trades.slice(-60).reverse(), fills });
+    // No longer watched: still show what we know and what the agent did.
+    const c = storedCoin(mint);
+    if (!c && !fills.length) return send(res, 404, { error: "Unknown coin" });
+    return send(res, 200, { mint, symbol: c?.symbol ?? null, name: c?.name ?? null, stage: c?.stage ?? null, pairAddress: c ? pairAddress(c) : null, socials: c?.socials ?? null, tracked: false, fills });
   }
   send(res, 404, { error: "not found" });
 });

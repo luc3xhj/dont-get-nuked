@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Pair } from "./types";
 
 /** Fetch JSON now and every `intervalMs`, pausing while the tab is hidden unless `background` is set. */
 export function usePolling<T>(url: string | null, intervalMs: number, background = false) {
@@ -44,19 +43,4 @@ export function usePolling<T>(url: string | null, intervalMs: number, background
 export function useSolPrice(background = false) {
   const { data } = usePolling<{ priceUsd: number }>("/api/sol", 15_000, background);
   return data?.priceUsd ?? 0;
-}
-
-export function usePairs(addresses: string[], intervalMs = 3_000, background = false) {
-  const key = [...new Set(addresses)].sort().join(",");
-  const { data, error, updatedAt } = usePolling<Pair[]>(key ? `/api/pairs?addresses=${key}` : null, intervalMs, background);
-  const byAddress: Record<string, Pair> = {};
-  for (const p of data ?? []) byAddress[p.pairAddress] = p;
-  return { pairs: byAddress, error, updatedAt };
-}
-
-/** Graduated pool per token address (only for tokens that have left the bonding curve). */
-export function useGraduated(tokenAddresses: string[], background = false) {
-  const key = [...new Set(tokenAddresses)].sort().join(",");
-  const { data } = usePolling<Record<string, Pair>>(key ? `/api/graduated?tokens=${key}` : null, 15_000, background);
-  return data ?? {};
 }
