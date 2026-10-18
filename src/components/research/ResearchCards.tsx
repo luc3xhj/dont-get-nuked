@@ -13,6 +13,7 @@ export const EFFECT: Record<ResearchDecision["effect"], string> = {
   resized_entry: "Entry size changed",
   unchanged: "Decision unchanged",
   other_gates: "Other gates also blocked entry",
+  requirement_satisfied: "Research met a requirement; other checks still block",
   no_analysis: "No analysis available",
   expired_analysis: "Expired analysis ignored",
   exit_requested: "Exit triggered by analysis",

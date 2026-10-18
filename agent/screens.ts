@@ -105,17 +105,31 @@ export function runScreens(s: CoinState): ScreenResult[] {
       fu.at,
     );
     const top = fu.clusters[0];
+    const coverage = fu.coverage ?? 1;
+    const partial = coverage < CONFIG.decision.minFundingCoverage;
+    const failedNote = fu.failed?.length
+      ? ` · ${fu.failed.length} lookup${fu.failed.length > 1 ? "s" : ""} failed (${Object.keys(fu.failureCounts ?? {}).join(", ").replace(/_/g, " ")}); retrying`
+      : "";
     add(
       "funding",
       "Funding cluster",
-      fu.topClusterPct >= t.fundingClusterVetoPct ? "veto" : fu.topClusterPct >= t.fundingClusterWarnPct ? "warn" : "ok",
+      // A found cluster stands even on partial coverage; a clean result on partial coverage is not "ok".
+      fu.topClusterPct >= t.fundingClusterVetoPct
+        ? "veto"
+        : fu.topClusterPct >= t.fundingClusterWarnPct
+          ? "warn"
+          : partial
+            ? "unknown"
+            : "ok",
       top
         ? `${top.wallets.length} top holders funded by ${top.funder.slice(0, 4)}…${top.funder.slice(-4)} hold ${top.pct.toFixed(1)}%`
         : `No shared funders among ${fu.checked} top holders${fu.exchangeFunded ? ` (${fu.exchangeFunded} exchange-funded)` : ""}${
             fu.unresolvedPct != null && fu.unresolvedPct > 0 ? ` · ${fu.unresolvedPct.toFixed(1)}% of supply with no traceable SOL transfer` : ""
-          }`,
+          }${partial ? ` · coverage ${(coverage * 100).toFixed(0)}% of top-holder supply` : ""}${failedNote}`,
       fu.at,
     );
+  } else if (fu?.failed?.length) {
+    add("funding", "Funding cluster", "unknown", `All ${fu.failed.length} wallet lookups failed (${Object.keys(fu.failureCounts ?? {}).join(", ").replace(/_/g, " ")}); retrying`, fu.at);
   } else if (s.holders) add("funding", "Funding cluster", "unknown", "Wallet checks pending");
 
   // Developer history (pump.fun): serial launchers and creators whose coins all died.

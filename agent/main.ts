@@ -19,6 +19,7 @@ import { researchReport } from "./research-report";
 import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio, walletSummary } from "./portfolio";
 import { restoreEpisodes, trackEpisodes } from "./episodes";
 import { evaluateSetups } from "./setups";
+import { funnelReport, markVersionStart } from "./funnel";
 import { COLUMNS, evaluatePulse, pulseReport, pulseTick, setFilters, type ColumnId } from "./pulse";
 import { discoverTraders, onTrades, tradersOnCoin, tradersReport, unwatchWallet, watchWallet } from "./traders";
 import {
@@ -174,6 +175,7 @@ const server = createServer((req, res) => {
       return;
     }
   }
+  if (url.pathname === "/api/funnel") return send(res, 200, funnelReport(Math.min(48, Number(url.searchParams.get("hours")) || 6)));
   if (url.pathname === "/api/portfolio") return send(res, 200, portfolioReport());
   if (url.pathname === "/api/wallet") return send(res, 200, walletSummary());
   if (url.pathname === "/api/dataset") return send(res, 200, datasetSummary());
@@ -259,6 +261,7 @@ const server = createServer((req, res) => {
 restore();
 restorePortfolio();
 restoreEpisodes();
+markVersionStart();
 for (const m of heldMints()) pinned.add(m);
 server.listen(CONFIG.port, "127.0.0.1", () => console.log(`agent API on http://127.0.0.1:${CONFIG.port}`));
 journal("start", null, { config: CONFIG });

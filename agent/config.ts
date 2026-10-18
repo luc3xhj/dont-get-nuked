@@ -6,9 +6,9 @@ export const CONFIG = {
    * Bump when strategy, screen, cost or execution semantics change. Trades and decisions are tagged
    * with it, and the agent only learns from benchmark trades of the versions listed below.
    */
-  strategyVersion: "2026-10-18.2",
+  strategyVersion: "2026-10-18.3",
   /** Benchmark (shadow) trades from these versions inform sizing/edge decisions. Explicit, never implicit. */
-  evidenceVersions: ["2026-10-18.2"] as string[],
+  evidenceVersions: ["2026-10-18.3"] as string[],
 
   /** Decision-time evidence and cost requirements (roadmap Stage A). */
   decision: {
@@ -18,6 +18,8 @@ export const CONFIG = {
     holderReportMaxAgeMs: 15 * 60_000,
     socialMaxAgeMs: 60 * 60_000,
     fundingMaxAgeMs: 2 * 3600_000,
+    /** Share of the top-10 holders' supply whose funding must be checked before the funding check counts. */
+    minFundingCoverage: 0.8,
     devMaxAgeMs: 6 * 3600_000,
     sizingIterations: 4,
   },

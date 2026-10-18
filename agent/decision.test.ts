@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { costModel, decideFrom, type DecisionSnapshot } from "./decision";
+import { costModel, decideFrom, entryLimit, type DecisionSnapshot } from "./decision";
 import { wilsonLower } from "./stats";
 
 const now = 1_800_000_000_000;
@@ -11,7 +11,8 @@ const base = (): DecisionSnapshot => ({
   symbol: "TST",
   creator: "creator",
   setup: "migrated_base",
-  plan: { entrySol: 1e-6, stopSol: 0.85e-6, tp1Sol: 1.5e-6, tp2Sol: 2e-6, maxHoldMin: 20 },
+  // Wide structural target: it must pay off on the conservative path (half at TP1, rest stopped near entry).
+  plan: { entrySol: 1e-6, stopSol: 0.85e-6, tp1Sol: 1.8e-6, tp2Sol: 2.2e-6, maxHoldMin: 20 },
   screens: [],
   essentials: [{ id: "holders", label: "Holder report", ok: true, detail: "1m old" }],
   evidence: { n: 0, avgR: 0, winRate: 0, shrunkR: 0, versions: ["test"] },
@@ -84,4 +85,36 @@ test("Wilson lower bound keeps small samples conservative", () => {
   assert.ok(wilsonLower(2, 2) < 0.6);
   assert.ok(wilsonLower(1, 3) < 0.15);
   assert.ok(wilsonLower(3, 3) >= 0.15);
+});
+
+test("research conviction can shrink risk but never raise it above the per-trade budget", () => {
+  const snap = base();
+  snap.analysis = {
+    at: now - 1000, expiresAt: now + 300_000, model: "test", verdict: "approve", conviction: 1.5, narrativeType: "tweet", narrative: "n",
+    contractVerified: "yes", copycat: false, redFlags: [], greenFlags: [], thesis: "t", wouldChangeMind: "w", sources: [], durationMs: 1,
+  };
+  const d = decideFrom(snap);
+  const budget = 10 * 0.01 * 0.5; // equity × risk × explore, conviction capped at 1
+  assert.ok(d.costs && -d.costs.stopNetSol <= budget * 1.05, `loss ${d.costs?.stopNetSol} exceeds budget ${budget}`);
+});
+
+test("poor economics at the current price waits for a structurally valid better entry", () => {
+  const snap = base();
+  snap.plan = { ...snap.plan, tp1Sol: 1.35e-6, tp2Sol: 1.6e-6 };
+  const d = decideFrom(snap);
+  assert.equal(d.take, false);
+  assert.match(d.reasons.join(" "), /Waiting for a better entry/);
+  assert.ok(d.entryLimitSol && d.entryLimitSol < snap.plan.entrySol && d.entryLimitSol > snap.plan.stopSol);
+  const atLimit = costModel(snap.pool!, { ...snap.plan, entrySol: d.entryLimitSol }, d.sizeSol, snap.exec);
+  assert.ok(atLimit.netRewardRisk >= 1 - 1e-6);
+  // A target too close to the stop can't be rescued by any entry.
+  assert.equal(entryLimit(snap.pool!, { ...snap.plan, tp1Sol: 1.03e-6 }, 0.1, snap.exec, 1), null);
+});
+
+test("exit scenarios never count TP2 as the reward", () => {
+  const snap = base();
+  const m = costModel(snap.pool!, snap.plan, 0.1, snap.exec);
+  assert.ok(m.scenarios.tp1ThenTp2 > m.scenarios.tp1ThenStop);
+  assert.equal(m.tp1NetSol, m.scenarios.tp1ThenStop);
+  assert.ok(m.scenarios.timeExit < 0, "doing nothing still costs fees");
 });

@@ -32,8 +32,10 @@ export const ANALYST = {
   model: process.env.ANALYST_MODEL || "gpt-6.1-sol",
   maxPerHour: Number(process.env.ANALYST_MAX_PER_HOUR ?? 20),
   timeoutMs: 150_000,
-  /** Don't re-ask about the same coin sooner than this unless it's held. */
+  /** After a FAILED analysis, wait this long before trying the same coin again (failure backoff only). */
   retryMs: 10 * 60_000,
+  /** Refresh a report this long before it expires when the coin is held or near a trigger. */
+  refreshLeadMs: 2 * 60_000,
 };
 
 export const ANALYSIS_SCHEMA = {
@@ -106,19 +108,58 @@ export function runAnalyst(prompt: string) {
   });
 }
 
-const attempted = new Map<string, number>();
+/** Failed attempts only: a successful report is governed by its own validity, not by this backoff. */
+const failedAt = new Map<string, number>();
+/** What the last report was based on; a material change makes it worth re-asking before expiry. */
+const basis = new Map<string, string>();
 
-/** Next coin worth an analyst call: firing setups first, then armed ones, then held coins due a re-check. */
+/** The facts a verdict depends on. Unchanged facts never trigger a new (costly) analysis on their own. */
+export function evidenceFingerprint(s: CoinState): string {
+  const top10 = s.holders ? Math.round(s.holders.top10ExPoolPct / 5) * 5 : null;
+  return JSON.stringify({
+    stage: s.coin.stage,
+    setups: s.setups.map((x) => x.setup).sort(),
+    top10,
+    insiders: s.holders ? Math.round((s.holders.insiderPct ?? 0) / 5) * 5 : null,
+    social: s.social?.url ?? null,
+    links: [s.coin.socials.twitter, s.coin.socials.telegram, s.coin.socials.website],
+  });
+}
+
+const nearTrigger = (s: CoinState) => Math.max(0, ...s.setups.map((x) => x.trigger.filter((k) => k.ok).length / Math.max(1, x.trigger.length)));
+
+/**
+ * Who gets researched next: open positions, then firing and armed setups (closest to their trigger
+ * first), then promising coins from the Pulse list. Research usually starts while a setup is still
+ * developing, so a valid report is in place when the trigger fires.
+ */
 function pick(): CoinState | null {
   const now = Date.now();
-  const ready = (s: CoinState) => (!s.analysis || s.analysis.expiresAt < now) && now - (attempted.get(s.coin.mint) ?? 0) > ANALYST.retryMs;
-  const hot = [...coins.values()].filter((s) => s.hot && s.features && ready(s));
-  const score = (s: CoinState) =>
-    (s.setups.some((x) => x.status === "fire") ? 3 : 0) +
-    (s.setups.length ? 2 + Math.max(...s.setups.map((x) => x.quality)) : 0) +
-    (pinned.has(s.coin.mint) ? 1.5 : 0);
-  const best = hot.filter((s) => score(s) > 0).sort((a, b) => score(b) - score(a))[0];
-  return best ?? null;
+  const priority = (s: CoinState) =>
+    pinned.has(s.coin.mint)
+      ? 10
+      : s.setups.some((x) => x.status === "fire")
+        ? 8
+        : s.setups.length
+          ? 4 + 3 * nearTrigger(s)
+          : s.pulse?.status === "pass"
+            ? 1
+            : 0;
+  const due = (s: CoinState) => {
+    if (now - (failedAt.get(s.coin.mint) ?? 0) < ANALYST.retryMs) return false;
+    const a = s.analysis;
+    if (!a) return true;
+    const urgent = priority(s) >= 4;
+    // Expired, or about to expire on a coin that matters right now.
+    if (a.expiresAt <= now || (urgent && a.expiresAt - now < ANALYST.refreshLeadMs)) return true;
+    // Still valid: only a material change in the evidence justifies asking again.
+    return urgent && basis.has(s.coin.mint) && basis.get(s.coin.mint) !== evidenceFingerprint(s);
+  };
+  return (
+    [...coins.values()]
+      .filter((s) => s.hot && s.features && priority(s) > 0 && due(s))
+      .sort((a, b) => priority(b) - priority(a))[0] ?? null
+  );
 }
 
 export async function analystTick() {
@@ -132,7 +173,9 @@ export async function analystTick() {
   const s = pick();
   if (!s) return;
 
-  attempted.set(s.coin.mint, now);
+  const fingerprint = evidenceFingerprint(s);
+  // Whether this research was meant for a live setup (it is "late" if that setup is gone when it lands).
+  const forSetup = s.setups.length > 0 || pinned.has(s.coin.mint);
   analystHealth.status = "running";
   analystHealth.running = s.coin.symbol;
   analystHealth.calls.push(now);
@@ -166,14 +209,28 @@ export async function analystTick() {
       durationMs: Date.now() - started,
     };
     s.analysis = a;
+    basis.set(s.coin.mint, fingerprint);
     saveReport(s.coin.mint, "analysis", a.at, a);
-    journal("analysis", s.coin.mint, { analysis: a, evidence, usage: raw.usage, costUsd: raw.total_cost_usd });
+    // in_time: a setup (or position) is still live · late: the setup it was for is gone ·
+    // early: discovery research on a promising coin before any setup formed.
+    const timing = s.setups.length || pinned.has(s.coin.mint) ? "in_time" : forSetup ? "late" : "early";
+    journal("analysis", s.coin.mint, {
+      analysis: a,
+      evidence,
+      usage: raw.usage,
+      costUsd: raw.total_cost_usd,
+      timing,
+      latencyMs: a.durationMs,
+      evidenceAt: evidence.research?.at ?? null,
+      model: ANALYST.model,
+    });
     analystHealth.status = "idle";
     analystHealth.lastError = null;
   } catch (e) {
     const code = (e as { code?: string }).code;
     analystHealth.status = code === "not-installed" ? "not-installed" : code === "not-logged-in" ? "not-logged-in" : "error";
     analystHealth.lastError = e instanceof Error ? e.message : String(e);
+    failedAt.set(s.coin.mint, Date.now());
     journal("analysis_error", s.coin.mint, { error: analystHealth.lastError, symbol: s.coin.symbol, research });
   } finally {
     analystHealth.running = null;

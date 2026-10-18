@@ -6,7 +6,7 @@
 import { NETWORK_FEE_SOL } from "../src/lib/amm";
 import { CONFIG } from "./config";
 import { db, journal } from "./db";
-import { decideFrom, type DecisionResult, type DecisionSnapshot } from "./decision";
+import { decideFrom, POST_TP1_STOP, TP1_FRACTION, type DecisionResult, type DecisionSnapshot } from "./decision";
 import { EXEC, fillBuy, fillSell, latency, liquidationValue, poolOf } from "./execution";
 import { essentialsFor } from "./requirements";
 import { SETUP_LABEL, type Plan, type SetupEval, type SetupId } from "./setups";
@@ -136,6 +136,8 @@ type Order = {
   draws?: { latency: number; fail: number };
   /** Set once a sell has waited past the timeout without a fresh price (journaled once). */
   waitingSince?: number;
+  /** A TP1 sell: the position only counts TP1 as done (and moves its stop) once this fills. */
+  kind?: "tp1";
 };
 
 // ---------- persistence ----------
@@ -353,6 +355,7 @@ export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now()): De
     plan: ev.plan!,
     screens: s.screens.map((x) => ({ id: x.id, label: x.label, level: x.level, status: x.status })),
     essentials: essentialsFor(s, ev.setup, now),
+    essentialsWithoutAnalysis: essentialsFor({ ...s, analysis: null }, ev.setup, now),
     evidence: evd,
     account: {
       equity,
@@ -607,6 +610,11 @@ function processOrders() {
         p.proceedsSol += fill.sol;
         p.tokens -= tokensIn;
         p.exiting = false;
+        if (o.kind === "tp1") {
+          // Only a confirmed TP1 fill locks in: stop to breakeven plus costs, then trail.
+          p.tp1Done = true;
+          p.stopSol = Math.max(p.stopSol, p.entryPriceSol * POST_TP1_STOP);
+        }
         saveAccount(a);
         journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "sell", sol: fill.sol, tokens: tokensIn, priceSol: fill.priceSol, reason: o.reason });
         if (p.tokens <= p.initialTokens * 1e-6) {
@@ -618,7 +626,14 @@ function processOrders() {
   }
 }
 
-function placeSell(p: Position, fraction: number, reason: string, analysisId: string | null = null, withoutExitReason: string | null = null) {
+function placeSell(
+  p: Position,
+  fraction: number,
+  reason: string,
+  analysisId: string | null = null,
+  withoutExitReason: string | null = null,
+  kind?: Order["kind"],
+) {
   const now = Date.now();
   p.exiting = true;
   const decisionId = uid();
@@ -639,6 +654,7 @@ function placeSell(p: Position, fraction: number, reason: string, analysisId: st
     reason,
     version: p.version,
     draws,
+    kind,
   });
   journal("order", p.mint, { id: orderId, decisionId, analysisId, positionId: p.id, account: p.account, side: "sell", reason });
   if (analysisId) journal("exit_decision", p.mint, {
@@ -659,13 +675,8 @@ function manage(p: Position) {
   p.highSol = Math.max(p.highSol, price);
 
   if (price <= p.stopSol) return placeSell(p, 1, p.tp1Done ? "Trailing stop" : "Stop loss");
-  if (!p.tp1Done && price >= p.plan.tp1Sol) {
-    p.tp1Done = true;
-    // Lock in: stop to breakeven plus costs, then trail.
-    p.stopSol = Math.max(p.stopSol, p.entryPriceSol * 1.04);
-    savePosition(p);
-    return placeSell(p, 0.5, "Take profit 1 (half)");
-  }
+  // TP1 counts as done only when this sell fills (a failed sell is retried on the next tick).
+  if (!p.tp1Done && price >= p.plan.tp1Sol) return placeSell(p, TP1_FRACTION, "Take profit 1 (half)", null, null, "tp1");
   if (p.tp1Done) {
     const trail = p.highSol * (1 - RISK.trailPct);
     if (trail > p.stopSol) {

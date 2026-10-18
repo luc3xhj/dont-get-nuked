@@ -39,11 +39,21 @@ export function essentialsFor(s: CoinState, setup: SetupId, now = Date.now()): E
     !h ? "not fetched" : now - h.at <= D.holderReportMaxAgeMs ? age(h.at, now) : `stale (${age(h.at, now)})`,
   );
   const fu = s.funding;
+  const coverage = fu?.coverage ?? 1;
+  const fundingFresh = !!fu && now - fu.at <= D.fundingMaxAgeMs;
   add(
     "funding",
     "Top-holder funding",
-    !!fu && now - fu.at <= D.fundingMaxAgeMs,
-    !fu ? "not checked" : now - fu.at <= D.fundingMaxAgeMs ? `${fu.checked} wallets, ${age(fu.at, now)}` : `stale (${age(fu.at, now)})`,
+    fundingFresh && coverage >= D.minFundingCoverage,
+    !fu
+      ? "not checked yet"
+      : !fundingFresh
+        ? `stale (${age(fu.at, now)})`
+        : coverage < D.minFundingCoverage
+          ? `coverage incomplete: ${(coverage * 100).toFixed(0)}% of top-holder supply checked${
+              fu.failed?.length ? `, ${fu.failed.length} lookup${fu.failed.length > 1 ? "s" : ""} failed; retry scheduled` : ""
+            }`
+          : `${fu.checked}/${fu.requested ?? fu.checked} wallets, ${(coverage * 100).toFixed(0)}% coverage, ${age(fu.at, now)}`,
   );
   if (setup === "new_dump" || setup === "dev_base")
     add(

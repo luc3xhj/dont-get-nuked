@@ -44,6 +44,8 @@ export type DecisionSnapshot = {
   screens: { id: string; label: string; level: "veto" | "warn" | "ok" | "unknown"; status?: string }[];
   /** Evidence this setup cannot do without; a failed one defers the entry. */
   essentials: EssentialCheck[];
+  /** The same essentials evaluated without the analysis (differs when only research satisfies one). */
+  essentialsWithoutAnalysis?: EssentialCheck[];
   /** What the benchmark has shown for this setup, from explicitly listed strategy versions. */
   evidence: { n: number; avgR: number; winRate: number; shrunkR: number; versions: string[] };
   account: { equity: number; cash: number; open: number; gate: string | null; busy: boolean; reentry: boolean; sameCreatorOpen: number };
@@ -54,22 +56,46 @@ export type DecisionSnapshot = {
   risk: RiskParams;
 };
 
+/**
+ * Net result of each way the managed trade can end (all fees, impact, slippage and network costs
+ * included). Position management sells TP1_FRACTION at TP1, then moves the stop to entry × 1.04.
+ */
+export type ExitScenarios = {
+  /** Stop hit before TP1: whole position at the gapped stop. */
+  stopBeforeTp1: number;
+  /** TP1 filled, then the remainder stopped at the moved stop (with gap). */
+  tp1ThenStop: number;
+  /** TP1 and TP2 both fill. */
+  tp1ThenTp2: number;
+  /** Nothing happens before the time stop: everything sold at the entry price. */
+  timeExit: number;
+};
+
 /** What this exact order would cost and return under the plan, net of fees, impact and slippage. */
 export type CostModel = {
   sizeSol: number;
   spentSol: number;
   tokens: number;
   entryImpact: number;
-  /** Everything sold at TP1 (conservative reward). */
+  /** Conservative win: TP1, then the remainder stopped (never assumes TP2). */
   tp1NetSol: number;
-  /** Half at TP1, half at TP2 (the plan's ladder). */
+  /** The full ladder (TP1 + TP2): shown, but never used to justify an entry. */
   planNetSol: number;
   /** Everything sold at the gapped stop (negative). */
   stopNetSol: number;
+  scenarios: ExitScenarios;
+  /** Conservative win ÷ loss at the stop. */
   netRewardRisk: number;
   /** Round-trip cost at TP1 as a fraction of size (fees + impact + slippage + network). */
   roundTripCostPct: number;
 };
+
+/** Share of the position sold at TP1 (position management uses the same value). */
+export const TP1_FRACTION = 0.5;
+/** After TP1 the stop moves to entry × this. */
+export const POST_TP1_STOP = 1.04;
+/** A better entry must stay at least this far above the structural stop. */
+export const MIN_STOP_DISTANCE = 0.05;
 
 export type DecisionResult = {
   take: boolean;
@@ -83,6 +109,8 @@ export type DecisionResult = {
   regime: { level: string; reasons: string[] };
   impact: AnalysisImpact;
   costs: CostModel | null;
+  /** When the economics fail at the current price: the highest entry that would pass (null = none). */
+  entryLimitSol?: number | null;
 };
 
 /** The pool as it would look with spot at `price` (same constant product). */
@@ -93,27 +121,58 @@ function poolAtPrice(pool: Pool, price: number): Pool {
 }
 
 export function costModel(pool: Pool, plan: Plan, sizeSol: number, exec: ExecAssumptions): CostModel {
-  const buy = quoteBuy(pool, sizeSol);
+  // The pool as it stands at the plan's entry price (the quote may sit slightly above or below it).
+  const at = poolAtPrice(pool, plan.entrySol);
+  const buy = quoteBuy(at, sizeSol);
   const tokens = buy.tokensOut * (1 - exec.adverseSlippage);
   const spentSol = sizeSol + exec.networkFeeSol;
   // quoteSell already deducts the swap fee and the network fee.
   const sellAt = (price: number, qty: number) => quoteSell(poolAtPrice(pool, price), qty).solOut * (1 - exec.adverseSlippage);
   const risk = (plan.entrySol - plan.stopSol) / plan.entrySol;
+  const gapped = (stop: number) => stop - plan.entrySol * risk * (exec.stopGap - 1);
+  const first = tokens * TP1_FRACTION;
+  const rest = tokens - first;
   const tp1All = sellAt(plan.tp1Sol, tokens);
-  const ladder = sellAt(plan.tp1Sol, tokens / 2) + sellAt(plan.tp2Sol, tokens / 2);
-  const stopAll = sellAt(plan.entrySol * (1 - risk * exec.stopGap), tokens);
+  const tp1Part = sellAt(plan.tp1Sol, first);
+  const scenarios: ExitScenarios = {
+    stopBeforeTp1: sellAt(gapped(plan.stopSol), tokens) - spentSol,
+    tp1ThenStop: tp1Part + sellAt(gapped(plan.entrySol * POST_TP1_STOP), rest) - spentSol,
+    tp1ThenTp2: tp1Part + sellAt(plan.tp2Sol, rest) - spentSol,
+    timeExit: sellAt(plan.entrySol, tokens) - spentSol,
+  };
   const grossTp1 = sizeSol * (plan.tp1Sol / plan.entrySol);
   return {
     sizeSol,
     spentSol,
     tokens,
     entryImpact: buy.priceImpact,
-    tp1NetSol: tp1All - spentSol,
-    planNetSol: ladder - spentSol,
-    stopNetSol: stopAll - spentSol,
-    netRewardRisk: (tp1All - spentSol) / Math.max(1e-9, spentSol - stopAll),
+    tp1NetSol: scenarios.tp1ThenStop,
+    planNetSol: scenarios.tp1ThenTp2,
+    stopNetSol: scenarios.stopBeforeTp1,
+    scenarios,
+    netRewardRisk: scenarios.tp1ThenStop / Math.max(1e-9, -scenarios.stopBeforeTp1),
     roundTripCostPct: grossTp1 ? (grossTp1 - tp1All + exec.networkFeeSol) / sizeSol : 0,
   };
+}
+
+/**
+ * The highest entry price at which the plan still meets the reward/risk requirement (stop and targets
+ * fixed by structure, entry at least MIN_STOP_DISTANCE above the stop). Null when no such entry pays.
+ */
+export function entryLimit(pool: Pool, plan: Plan, sizeSol: number, exec: ExecAssumptions, minRR: number): number | null {
+  const rr = (entry: number) => costModel(pool, { ...plan, entrySol: entry }, sizeSol, exec).netRewardRisk;
+  // An entry hugging the stop would be stopped by ordinary noise, so it doesn't count as a valid entry.
+  let lo = plan.stopSol / (1 - MIN_STOP_DISTANCE);
+  if (lo >= Math.min(plan.entrySol, plan.tp1Sol)) return null;
+  let hi = Math.min(plan.entrySol, plan.tp1Sol);
+  if (rr(lo) < minRR) return null;
+  if (rr(hi) >= minRR) return hi;
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2;
+    if (rr(mid) >= minRR) lo = mid;
+    else hi = mid;
+  }
+  return lo;
 }
 
 const fmt = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(4)}◎`;
@@ -151,7 +210,8 @@ export function decideFrom(snap: DecisionSnapshot): DecisionResult {
   const sizeCap = Math.max(0, Math.min(account.equity * R.maxPositionFraction, impactCap, account.cash * 0.95));
   const sizeFor = (conviction: number) => {
     if (!snap.pool || sizeCap <= 0) return 0;
-    const budget = account.equity * R.riskPerTrade * (mode === "explore" ? R.explorationRiskScale : 1) * conviction * regimeScale;
+    // Research can shrink the risk budget, never raise it above the configured per-trade risk.
+    const budget = account.equity * R.riskPerTrade * (mode === "explore" ? R.explorationRiskScale : 1) * Math.min(1, conviction) * regimeScale;
     let size = Math.min(sizeCap, budget / Math.max(0.01, stopRisk * exec.stopGap + 0.05));
     for (let i = 0; i < R.sizingIterations; i++) {
       const loss = -costModel(snap.pool, plan, size, exec).stopNetSol;
@@ -164,13 +224,22 @@ export function decideFrom(snap: DecisionSnapshot): DecisionResult {
   const checksFor = (sizeSol: number) => {
     if (!snap.pool) return [];
     const m = costModel(snap.pool, plan, sizeSol, exec);
-    if (m.tp1NetSol <= 0) return [`TP1 doesn't cover costs at ${sizeSol.toFixed(3)}◎ (net ${fmt(m.tp1NetSol)})`];
-    if (m.netRewardRisk < R.minNetRewardRisk)
-      return [`Net reward/risk ${m.netRewardRisk.toFixed(2)} below ${R.minNetRewardRisk} (TP1 ${fmt(m.tp1NetSol)} vs stop ${fmt(m.stopNetSol)})`];
-    return [];
+    if (m.tp1NetSol > 0 && m.netRewardRisk >= R.minNetRewardRisk) return [];
+    const limit = entryLimit(snap.pool, plan, sizeSol, exec, R.minNetRewardRisk);
+    const why = `net reward/risk ${m.netRewardRisk.toFixed(2)} against a required ${R.minNetRewardRisk.toFixed(2)} (TP1 then stop ${fmt(m.tp1NetSol)} vs stop ${fmt(m.stopNetSol)})`;
+    return [
+      limit === null
+        ? `Targets can't pay for the stop at any entry: ${why}`
+        : `Waiting for a better entry ≤ ${limit.toPrecision(3)}◎ (${((1 - limit / plan.entrySol) * 100).toFixed(1)}% lower): ${why}`,
+    ];
   };
 
+  // Requirements only the research satisfies: they would block the same decision without it.
+  const onlyResearch = (snap.essentialsWithoutAnalysis ?? [])
+    .filter((e) => !e.ok && snap.essentials.find((x) => x.id === e.id)?.ok)
+    .map((e) => `Missing essential evidence without research: ${e.label} (${e.detail})`);
   const { actual, impact } = compareAnalysis({
+    withoutAnalysisReasons: onlyResearch,
     mint: snap.mint,
     analysis: snap.analysis,
     now: snap.at,
@@ -190,5 +259,7 @@ export function decideFrom(snap: DecisionSnapshot): DecisionResult {
     regime: snap.regime,
     impact,
     costs: snap.pool && actual.sizeSol > 0 ? costModel(snap.pool, plan, actual.sizeSol, exec) : null,
+    entryLimitSol:
+      snap.pool && actual.sizeSol > 0 && !actual.take ? entryLimit(snap.pool, plan, actual.sizeSol, exec, R.minNetRewardRisk) : undefined,
   };
 }

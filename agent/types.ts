@@ -238,6 +238,10 @@ export type DevReport = {
 /** Top-holder wallet ages and funding sources. */
 export type FundingReport = {
   at: number;
+  /** When this report stops counting as current evidence. */
+  expiresAt?: number;
+  /** Top holders we tried to check, and how many lookups succeeded. */
+  requested?: number;
   checked: number;
   /** Wallets under a day old (or with almost no history). */
   fresh: number;
@@ -249,8 +253,16 @@ export type FundingReport = {
   unknownFunder: number;
   /** Funders identified only as a fee payer (weak evidence: not used to form clusters). */
   payerOnly: number;
-  /** Share of supply in the holders we checked, and the part whose funding stayed unresolved. */
+  /** Funders backed by an actual SOL transfer (strong evidence). */
+  transferBacked?: number;
+  /** Share of supply in the holders we tried to check, in the ones we did check, and their ratio. */
+  requestedPct?: number;
   checkedPct: number;
+  coverage?: number;
+  /** Supply whose funding is unresolved: weak (fee payer only), no funder found, or lookup failed. */
   unresolvedPct: number;
+  /** Lookups that failed, with a category: a technical failure is not evidence against the token. */
+  failed?: { address: string; pct: number; category: "rate_limited" | "unsupported_transaction" | "history_unavailable" | "network" | "other"; error: string }[];
+  failureCounts?: Partial<Record<string, number>>;
   provider: "helius" | "public";
 };

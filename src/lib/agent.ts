@@ -402,3 +402,42 @@ export type PulseColumn = {
   coins: PulseCoin[];
 };
 export type PulseReport = { at: number; note: string; labels: Record<string, string>; columns: PulseColumn[] };
+
+// ---------- Decision funnel ----------
+
+export type FunnelCandidate = {
+  mint: string;
+  symbol: string;
+  setup: string;
+  stage: "armed" | "fired" | "blocked" | "passed";
+  episode: SetupEpisode | null;
+  held: boolean;
+  waitingOn: string[];
+  primaryBlocker: string | null;
+  blockers: string[];
+  blockerCategory: string | null;
+  nextAction: string;
+  research: { verdict: string; validForMin: number; effect: string | null } | null;
+  decidedAt: number | null;
+};
+export type FunnelReport = {
+  version: string;
+  hours: number;
+  /** Counting starts at the later of the window start and this strategy version's start. */
+  since: number;
+  stages: { id: string; label: string; n: number }[];
+  blockers: { id: string; label: string; primary: number; any: number }[];
+  researchEffects: Record<string, number>;
+  researchAtDecision: { decisions: number; withValidReport: number };
+  technical: {
+    fundingReportsFailed: number;
+    fundingReportsPartial: number;
+    fundingLookupFailures: Record<string, number>;
+    analysisErrors: number;
+    lateAnalyses: number;
+    fillsFailed: number;
+    ordersExpired: number;
+    exitsWaitingForPrice: number;
+  };
+  candidates: FunnelCandidate[];
+};

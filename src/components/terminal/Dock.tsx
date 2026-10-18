@@ -6,6 +6,7 @@ import EvidencePanel from "../EvidencePanel";
 import { ClosedTrades, OpenPositions } from "../PositionsTable";
 import { AnalysisCard, CHANGED, DecisionCard } from "../research/ResearchCards";
 import { useTerminal } from "./data";
+import Funnel from "./Funnel";
 import { TradersTab } from "./Traders";
 import { Metric } from "./ui";
 import type { DockTab, Layout } from "./layout";
@@ -163,12 +164,14 @@ function Decisions({ onSelect }: { onSelect: (mint: string) => void }) {
   if (!rows.length)
     return (
       <>
+        <Funnel onSelect={onSelect} />
         {header}
         <div className="p-4 text-xs text-zinc-500">No setup has fired since the agent last restarted.</div>
       </>
     );
   return (
     <>
+      <Funnel onSelect={onSelect} />
       {header}
       <table className="w-full text-xs">
       <tbody>

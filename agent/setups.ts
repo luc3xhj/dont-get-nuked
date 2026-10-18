@@ -58,12 +58,18 @@ const buyShare = (f: Features["flow60s"]) => (f.buySol + f.sellSol ? f.buySol / 
 const between = (v: number, lo: number, hi: number) => v >= lo && v <= hi;
 const c = (label: string, ok: boolean, value: string): Check => ({ label, ok, value });
 
-/** Scalp plan: structural stop below the low, first target at >= 1.5R (and a floor), second at a retrace level. */
-function plan(entry: number, stop: number, tp2: number, maxHoldMin: number, minTp1 = 0.25): Plan {
-  const risk = (entry - stop) / entry;
-  const tp1 = entry * (1 + Math.max(minTp1, 1.5 * risk));
-  return { entrySol: entry, stopSol: stop, tp1Sol: tp1, tp2Sol: Math.max(tp2, tp1 * 1.15), maxHoldMin };
+/**
+ * Plan from market structure only: the stop is where the setup is invalidated, targets are levels the
+ * market has shown (retracements of the move, the top of the range). Nothing is stretched to make the
+ * numbers work; whether the trade pays after costs is decided later, and if it doesn't at this price
+ * the agent waits for a better entry or lets the setup expire. Null if there's no target above entry.
+ */
+function plan(entry: number, stop: number, tp1: number, tp2: number, maxHoldMin: number): Plan | null {
+  if (!(entry > stop) || !(tp1 > entry * 1.02)) return null;
+  return { entrySol: entry, stopSol: stop, tp1Sol: tp1, tp2Sol: Math.max(tp2, tp1 * 1.05), maxHoldMin };
 }
+/** Price level `f` of the way from `lo` back up to `hi`. */
+const retrace = (lo: number, hi: number, f: number) => lo + f * (hi - lo);
 
 /**
  * A curve that is ~90% full has little upside left to graduation but full downside, and graduation
@@ -91,7 +97,11 @@ const MAX_RISK = 0.3; // Setuh's "mental loss limit": skip setups whose structur
 function finish(setup: SetupId, structure: Check[], trigger: Check[], p: Plan | null): SetupEval | null {
   if (!structure.every((x) => x.ok)) return null;
   const riskOk = p ? (p.entrySol - p.stopSol) / p.entrySol <= MAX_RISK : false;
-  const trig = [...trigger, c("Stop within loss limit", riskOk, p ? pct((p.entrySol - p.stopSol) / p.entrySol) : "–")];
+  const trig = [
+    ...trigger,
+    c("Target above entry (structure)", !!p, p ? `TP1 +${pct(p.tp1Sol / p.entrySol - 1)}` : "price already at the target level"),
+    c("Stop within loss limit", riskOk, p ? pct((p.entrySol - p.stopSol) / p.entrySol) : "–"),
+  ];
   const passed = trig.filter((x) => x.ok).length;
   return {
     setup,
@@ -125,7 +135,8 @@ function newDump(s: CoinState, f: Features): SetupEval | null {
     c("Net SOL in", f60.netSol > 0.3, `${f60.netSol.toFixed(2)}◎`),
   ];
   const ath = f.athMcapSol / 1e9;
-  return finish("new_dump", structure, trigger, plan(f.priceSol, f.lowSol * 0.93, f.lowSol + 0.6 * (ath - f.lowSol), 8));
+  // Dump bounce: first target the 38.2% retrace of the dump, second the 61.8%.
+  return finish("new_dump", structure, trigger, plan(f.priceSol, f.lowSol * 0.93, retrace(f.lowSol, ath, 0.382), retrace(f.lowSol, ath, 0.618), 8));
 }
 
 function stretchDeep(s: CoinState, f: Features): SetupEval | null {
@@ -146,7 +157,7 @@ function stretchDeep(s: CoinState, f: Features): SetupEval | null {
     c("Bounce 5–40%", between(f.bounceFromLow, 0.05, 0.4), pct(f.bounceFromLow)),
   ];
   const ath = f.athMcapSol / 1e9;
-  return finish("stretch_deep", structure, trigger, plan(f.priceSol, f.lowSol * 0.93, f.lowSol + 0.5 * (ath - f.lowSol), 12));
+  return finish("stretch_deep", structure, trigger, plan(f.priceSol, f.lowSol * 0.93, retrace(f.lowSol, ath, 0.382), retrace(f.lowSol, ath, 0.5), 12));
 }
 
 function stretchPullback(s: CoinState, f: Features): SetupEval | null {
@@ -166,7 +177,9 @@ function stretchPullback(s: CoinState, f: Features): SetupEval | null {
     c("Buys ≥ 60% of 60s flow", buyShare(f60) >= 0.6, pct(buyShare(f60))),
     c("≥ 5 buyers in 60s", f60.buyers >= 5, `${f60.buyers}`),
   ];
-  return finish("stretch_pullback", structure, trigger, plan(f.priceSol, f.lowSol * 0.94, (f.athMcapSol / 1e9) * 0.95, 12, 0.2));
+  // Ordinary pullback in a trend: first target the 61.8% retrace, second a retest just under the high.
+  const high = f.athMcapSol / 1e9;
+  return finish("stretch_pullback", structure, trigger, plan(f.priceSol, f.lowSol * 0.94, retrace(f.lowSol, high, 0.618), high * 0.97, 12));
 }
 
 function devBase(s: CoinState, f: Features, dev: DevHistory): SetupEval | null {
@@ -194,7 +207,8 @@ function devBase(s: CoinState, f: Features, dev: DevHistory): SetupEval | null {
     c("Net SOL in", f60.netSol > 0, `${f60.netSol.toFixed(2)}◎`),
     c("≥ 3 buyers in 60s", f60.buyers >= 3, `${f60.buyers}`),
   ];
-  return finish("dev_base", structure, trigger, plan(f.priceSol, f.lo10Sol * 0.92, f.priceSol * 1.6, 15));
+  // Range trade: first target the top of the 10-minute range, second a measured move above it.
+  return finish("dev_base", structure, trigger, plan(f.priceSol, f.lo10Sol * 0.92, f.hi10Sol, f.hi10Sol + (f.hi10Sol - f.lo10Sol), 15));
 }
 
 function migratedBase(s: CoinState, f: Features): SetupEval | null {
@@ -217,7 +231,7 @@ function migratedBase(s: CoinState, f: Features): SetupEval | null {
     c("Net SOL in", f60.netSol > 0, `${f60.netSol.toFixed(2)}◎`),
     c("≥ 3 buyers in 60s", f60.buyers >= 3, `${f60.buyers}`),
   ];
-  return finish("migrated_base", structure, trigger, plan(f.priceSol, f.lo10Sol * 0.92, Math.max(f.hi10Sol * 1.15, f.priceSol * 1.5), 25));
+  return finish("migrated_base", structure, trigger, plan(f.priceSol, f.lo10Sol * 0.92, f.hi10Sol, f.hi10Sol + (f.hi10Sol - f.lo10Sol), 25));
 }
 
 /** All setups whose structure has formed for this coin, best first. */
