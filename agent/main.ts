@@ -120,7 +120,10 @@ loop("prune", 10 * 60_000, async () => {
   prune(new Set([...coins.values()].filter((s) => s.hot).map((s) => s.coin.mint)), 24 * 3600_000);
 });
 
-process.on("SIGINT", () => {
-  journal("stop", null, {});
-  process.exit(0);
-});
+// launchd sends SIGTERM on stop; Ctrl-C sends SIGINT.
+for (const sig of ["SIGINT", "SIGTERM"] as const)
+  process.on(sig, () => {
+    journal("stop", null, { signal: sig });
+    server.close();
+    process.exit(0);
+  });

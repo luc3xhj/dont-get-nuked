@@ -42,3 +42,4 @@ next-env.d.ts
 
 # agent worker data
 /agent/data/
+/agent/logs/
