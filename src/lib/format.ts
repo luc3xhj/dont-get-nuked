@@ -3,10 +3,19 @@ const SUB = "₀₁₂₃₄₅₆₇₈₉";
 /** Meme-coin friendly price: $0.0₅1234 for tiny values. */
 export function fmtPrice(v: number, prefix = "$"): string {
   if (!Number.isFinite(v) || v === 0) return `${prefix}0`;
+  // Chart axes can dip below zero.
+  if (v < 0) return `-${fmtPrice(-v, prefix)}`;
   if (v >= 1) return prefix + v.toLocaleString("en-US", { maximumFractionDigits: v >= 1000 ? 2 : 4 });
   if (v >= 0.001) return prefix + v.toFixed(6).replace(/0+$/, "");
-  const zeros = Math.floor(-Math.log10(v)) - 1;
-  const digits = Math.round(v * 10 ** (zeros + 4)).toString().slice(0, 4);
+  // Subscript = zeros after "0.0"; ceil (not floor) so exact powers of ten (0.00001) count right.
+  let zeros = Math.ceil(-Math.log10(v)) - 2;
+  let n = Math.round(v * 10 ** (zeros + 4));
+  // Three significant digits; rounding can carry into a fourth (999.6 → 1000): one fewer zero.
+  if (n >= 1_000) {
+    zeros--;
+    n = Math.round(v * 10 ** (zeros + 4));
+  }
+  const digits = n.toString().slice(0, 4);
   const sub = String(zeros).split("").map((d) => SUB[Number(d)]).join("");
   return `${prefix}0.0${sub}${digits}`;
 }

@@ -1,6 +1,16 @@
 "use client";
 
-import { CandlestickSeries, createChart, HistogramSeries, type IChartApi, type ISeriesApi, type UTCTimestamp } from "lightweight-charts";
+import {
+  CandlestickSeries,
+  createChart,
+  createSeriesMarkers,
+  HistogramSeries,
+  type IChartApi,
+  type ISeriesApi,
+  type ISeriesMarkersPluginApi,
+  type Time,
+  type UTCTimestamp,
+} from "lightweight-charts";
 import { useEffect, useRef, useState } from "react";
 import { fmtPrice } from "@/lib/format";
 import type { Candle } from "@/lib/types";
@@ -9,12 +19,14 @@ const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"] as const;
 type Tf = (typeof TIMEFRAMES)[number];
 const BUCKET: Record<Tf, number> = { "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400 };
 
+export type TradeMarker = { ts: number; side: "buy" | "sell"; label?: string };
 
-export default function PriceChart({ pairAddress, livePrice }: { pairAddress: string; livePrice: number }) {
+export default function PriceChart({ pairAddress, livePrice, markers = [] }: { pairAddress: string; livePrice: number; markers?: TradeMarker[] }) {
   const el = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi | null>(null);
   const candles = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volume = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const markerApi = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const last = useRef<Candle | null>(null);
   const [tf, setTf] = useState<Tf>("1m");
   const [status, setStatus] = useState<"loading" | "ready" | "empty" | "error">("loading");
@@ -38,13 +50,34 @@ export default function PriceChart({ pairAddress, livePrice }: { pairAddress: st
       priceFormat: { type: "custom", formatter: (p: number) => fmtPrice(p), minMove: 1e-12 },
     });
     volume.current = c.addSeries(HistogramSeries, { priceScaleId: "vol", priceFormat: { type: "volume" } });
+    markerApi.current = createSeriesMarkers(candles.current, []);
     c.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
     chart.current = c;
     return () => {
       c.remove();
       chart.current = null;
+      markerApi.current = null;
     };
   }, []);
+
+  // The agent's fills, snapped to the candle they happened in.
+  const markerKey = markers.map((m) => `${m.ts}${m.side}`).join(",");
+  useEffect(() => {
+    if (!markerApi.current || status !== "ready") return;
+    const bucket = BUCKET[tf];
+    markerApi.current.setMarkers(
+      [...markers]
+        .sort((a, b) => a.ts - b.ts)
+        .map((m) => ({
+          time: (Math.floor(m.ts / 1000 / bucket) * bucket) as UTCTimestamp,
+          position: m.side === "buy" ? ("belowBar" as const) : ("aboveBar" as const),
+          shape: m.side === "buy" ? ("arrowUp" as const) : ("arrowDown" as const),
+          color: m.side === "buy" ? "#34d399" : "#fb7185",
+          text: m.label ?? (m.side === "buy" ? "B" : "S"),
+        })),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [markerKey, tf, status]);
 
   useEffect(() => {
     let cancelled = false;
@@ -63,7 +96,7 @@ export default function PriceChart({ pairAddress, livePrice }: { pairAddress: st
           }
           candles.current.setData(data.map((d) => ({ ...d, time: d.time as UTCTimestamp })));
           volume.current.setData(
-            data.map((d) => ({ time: d.time as UTCTimestamp, value: d.volume, color: d.close >= d.open ? "#34d39940" : "#fb718540" }))
+            data.map((d) => ({ time: d.time as UTCTimestamp, value: d.volume, color: d.close >= d.open ? "#34d39940" : "#fb718540" })),
           );
           last.current = data.at(-1) ?? null;
           chart.current?.timeScale().fitContent();
@@ -92,7 +125,14 @@ export default function PriceChart({ pairAddress, livePrice }: { pairAddress: st
         ? { ...prev, high: Math.max(prev.high, livePrice), low: Math.min(prev.low, livePrice), close: livePrice }
         : prev && prev.time > now
           ? prev
-          : { time: now, open: prev?.close ?? livePrice, high: Math.max(prev?.close ?? livePrice, livePrice), low: Math.min(prev?.close ?? livePrice, livePrice), close: livePrice, volume: 0 };
+          : {
+              time: now,
+              open: prev?.close ?? livePrice,
+              high: Math.max(prev?.close ?? livePrice, livePrice),
+              low: Math.min(prev?.close ?? livePrice, livePrice),
+              close: livePrice,
+              volume: 0,
+            };
     if (bar === prev) return;
     last.current = bar;
     candles.current.update({ ...bar, time: bar.time as UTCTimestamp });

@@ -6,7 +6,15 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --import tsx --test agent/*.test.ts",
+    "research:check": "node --env-file-if-exists=.env.local --import tsx scripts/check-research.ts",
+    "agent": "node --env-file-if-exists=.env.local --import tsx agent/main.ts",
+    "agent:install": "node scripts/agent-service.mjs install",
+    "agent:start": "node scripts/agent-service.mjs start",
+    "agent:stop": "node scripts/agent-service.mjs stop",
+    "agent:status": "node scripts/agent-service.mjs status",
+    "agent:uninstall": "node scripts/agent-service.mjs uninstall"
   },
   "dependencies": {
     "lightweight-charts": "^5.2.1",
@@ -17,12 +25,13 @@
   "devDependencies": {
     "@eslint/eslintrc": "^3",
     "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
+    "@types/node": "^24.19.2",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "^15.5.28",
     "tailwindcss": "^4",
+    "tsx": "^4.20.6",
     "typescript": "^5"
   }
 }
