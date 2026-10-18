@@ -57,6 +57,12 @@ export const CONFIG = {
     devHeldWarnPct: 8,
     /** Veto when holders RugCheck links as insiders control at least this much supply. */
     insiderVetoPct: 10,
+    /** A creator launching this many coins a day is spraying launches, not building one. */
+    serialLaunches24h: 10,
+    /** Top holders sharing a non-exchange funder: likely one entity. */
+    fundingClusterWarnPct: 5,
+    fundingClusterVetoPct: 10,
+    freshWalletPct: 10,
     washWarn: 0.45,
     /** A call from an account this large is a chase risk (big-account calls did worst). */
     bigAccountFollowers: 200_000,

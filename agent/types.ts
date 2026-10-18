@@ -178,3 +178,35 @@ export type Features = {
 
 export type ScreenLevel = "veto" | "warn" | "ok" | "unknown";
 export type ScreenResult = { id: string; label: string; level: ScreenLevel; detail: string };
+
+/** A creator's launch history on pump.fun (excluding the coin being judged). */
+export type DevReport = {
+  at: number;
+  /** Launches found (the lookup returns at most 50, so `capped` means "50 or more"). */
+  launches: number;
+  capped: boolean;
+  launches24h: number;
+  graduated: number;
+  /** Graduated, or reached a $100k ATH. */
+  successes: number;
+  successRate: number;
+  bestAthUsd: number;
+  medianAthUsd: number;
+  /** Older than an hour and never passed a $10k ATH. */
+  died: number;
+};
+
+/** Top-holder wallet ages and funding sources. */
+export type FundingReport = {
+  at: number;
+  checked: number;
+  /** Wallets under a day old (or with almost no history). */
+  fresh: number;
+  freshPct: number;
+  /** Top holders that share a (non-exchange) first funder. */
+  clusters: { funder: string; wallets: string[]; pct: number }[];
+  topClusterPct: number;
+  exchangeFunded: number;
+  unknownFunder: number;
+  provider: "helius" | "public";
+};

@@ -585,7 +585,7 @@ function manage(p: Position) {
 }
 
 /** Screen vetoes that break a held position's thesis if they appear after entry. */
-const THESIS_VETOES = new Set(["insiders", "bundles", "liquidity", "lp", "rugged", "metadata"]);
+const THESIS_VETOES = new Set(["insiders", "bundles", "liquidity", "lp", "rugged", "metadata", "funding"]);
 
 let lastEquityAt = 0;
 

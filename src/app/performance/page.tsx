@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import EquityChart from "@/components/EquityChart";
+import EvidencePanel from "@/components/EvidencePanel";
 import { ClosedTrades } from "@/components/PositionsTable";
 import { pctSigned, SETUP_LABEL, type Account, type DatasetSummary, type PortfolioReport, type Stats } from "@/lib/agent";
 import { fmtAge, pnlColor } from "@/lib/format";
@@ -158,6 +159,11 @@ export default function Performance() {
           </p>
         </section>
       </div>
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-950">
+        <div className="border-b border-zinc-800 px-4 py-2 text-[11px] uppercase tracking-wide text-zinc-500">What predicts winners</div>
+        <EvidencePanel />
+      </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-950">
         <div className="border-b border-zinc-800 px-4 py-2 text-[11px] uppercase tracking-wide text-zinc-500">

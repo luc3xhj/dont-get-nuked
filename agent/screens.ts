@@ -88,6 +88,41 @@ export function runScreens(s: CoinState): ScreenResult[] {
     );
   }
 
+  // Top-holder wallets: fresh wallets and shared funders = one entity posing as many holders.
+  const fu = s.funding;
+  if (fu && fu.checked) {
+    add(
+      "fresh",
+      "Fresh wallets",
+      fu.fresh >= 3 || fu.freshPct >= t.freshWalletPct ? "warn" : "ok",
+      `${fu.fresh} of ${fu.checked} top holders are under a day old (${fu.freshPct.toFixed(1)}% of supply)`
+    );
+    const top = fu.clusters[0];
+    add(
+      "funding",
+      "Funding cluster",
+      fu.topClusterPct >= t.fundingClusterVetoPct ? "veto" : fu.topClusterPct >= t.fundingClusterWarnPct ? "warn" : "ok",
+      top
+        ? `${top.wallets.length} top holders funded by ${top.funder.slice(0, 4)}…${top.funder.slice(-4)} hold ${top.pct.toFixed(1)}%`
+        : `No shared funders among ${fu.checked} top holders${fu.exchangeFunded ? ` (${fu.exchangeFunded} exchange-funded)` : ""}`
+    );
+  } else if (s.holders) add("funding", "Funding cluster", "unknown", "Wallet checks pending");
+
+  // Developer history (pump.fun): serial launchers and creators whose coins all died.
+  const dv = s.dev;
+  if (!dv) add("devhistory", "Developer history", "unknown", "Not looked up yet");
+  else if (dv.launches24h >= t.serialLaunches24h)
+    add("devhistory", "Developer history", "warn", `Serial launcher: ${dv.launches24h} launches in 24h (${dv.successes} of ${dv.launches}${dv.capped ? "+" : ""} ever succeeded)`);
+  else if (dv.launches >= 5 && dv.successes === 0)
+    add("devhistory", "Developer history", "warn", `All ${dv.launches}${dv.capped ? "+" : ""} prior launches failed (best ATH $${Math.round(dv.bestAthUsd / 1000)}k)`);
+  else
+    add(
+      "devhistory",
+      "Developer history",
+      "ok",
+      dv.launches ? `${dv.launches}${dv.capped ? "+" : ""} prior launches · ${dv.graduated} graduated · best ATH $${Math.round(dv.bestAthUsd / 1000)}k` : "First launch"
+    );
+
   // Volume quality: fake volume (wash trading, bump bots) makes a coin look hot without real demand.
   const v = f.volume;
   if (v.washScore === null) add("volume", "Volume quality", "unknown", `Only ${v.trades} trades in 5m`);

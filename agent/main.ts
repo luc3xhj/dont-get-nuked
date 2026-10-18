@@ -12,6 +12,8 @@ import { runScreens, verdict } from "./screens";
 import { ANALYST, analystHealth, analystTick } from "./analyst";
 import { captureHot, datasetCsv, datasetSummary, labelTick, sampleTick } from "./dataset";
 import { regime, regimeTick } from "./regime";
+import { walletsTick } from "./wallets";
+import { evidenceReport } from "./evidence";
 import { tregHealth } from "./research";
 import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio, walletSummary } from "./portfolio";
 import { evaluateSetups } from "./setups";
@@ -35,7 +37,7 @@ const lastArmed = new Map<string, number>();
 function evaluate(s: CoinState) {
   s.features = computeFeatures(s);
   s.screens = runScreens(s);
-  s.setups = evaluateSetups(s, devHistory(s.coin.creator, s.coin.mint));
+  s.setups = evaluateSetups(s, devHistory(s));
   // Note when a setup first arms (once per coin+setup per 10 minutes) for the activity feed.
   for (const x of s.setups) {
     const key = `${s.coin.mint}:${x.setup}`;
@@ -90,6 +92,8 @@ function summary(s: CoinState) {
       insidersDetected: s.holders.insidersDetected,
     },
     social: s.social,
+    dev: s.dev,
+    funding: s.funding,
     setups: s.setups,
     analysis: s.analysis,
     held: pinned.has(s.coin.mint),
@@ -116,6 +120,7 @@ const server = createServer((req, res) => {
   if (url.pathname === "/api/portfolio") return send(res, 200, portfolioReport());
   if (url.pathname === "/api/wallet") return send(res, 200, walletSummary());
   if (url.pathname === "/api/dataset") return send(res, 200, datasetSummary());
+  if (url.pathname === "/api/evidence") return send(res, 200, evidenceReport());
   if (url.pathname === "/api/dataset-csv") {
     res.writeHead(200, {
       "content-type": "text/csv",
@@ -193,6 +198,7 @@ loop("reports", 5_000, reportsTick);
 loop("quotes", 2_000, quoteTick);
 loop("analyst", 5_000, analystTick);
 loop("regime", 60_000, async () => regimeTick());
+loop("wallets", 5_000, walletsTick);
 loop("dataset-sample", 20_000, sampleTick);
 loop("dataset-label", 60_000, labelTick);
 // Re-evaluate every hot coin each second so time-based features (windows, exhaustion) stay current between trades.

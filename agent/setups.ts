@@ -36,7 +36,7 @@ export type SetupEval = {
 };
 
 /** Creator history from coins we've observed ourselves (never assumed). */
-export type DevHistory = { coins: number; successes: number };
+export type DevHistory = { coins: number; successes: number; successRate: number; source: "pump.fun" | "observed" };
 
 const pct = (v: number) => `${(v * 100).toFixed(0)}%`;
 const buyShare = (f: Features["flow60s"]) => (f.buySol + f.sellSol ? f.buySol / (f.buySol + f.sellSol) : 0);
@@ -149,7 +149,12 @@ function stretchPullback(s: CoinState, f: Features): SetupEval | null {
 function devBase(s: CoinState, f: Features, dev: DevHistory): SetupEval | null {
   const lane = laneOf(s.coin, f.at);
   const structure = [
-    c("Dev with observed success", dev.successes >= 1, `${dev.successes} of ${dev.coins} prior coins`),
+    // "Proven" needs a real hit rate, not one lucky coin among dozens of launches.
+    c(
+      "Proven developer",
+      dev.successes >= 2 || (dev.successes >= 1 && dev.successRate >= 0.1),
+      `${dev.successes} of ${dev.coins} prior coins succeeded (${pct(dev.successRate)}, ${dev.source})`
+    ),
     c("On the curve", lane === "new" || lane === "stretch", lane ?? "–"),
     c("Sideways (10m range ≤ 25%)", f.range10m <= 0.25, pct(f.range10m)),
     c("Base ≥ 2m", f.baseMin >= 2, `${f.baseMin.toFixed(1)}m`),

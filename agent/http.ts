@@ -24,6 +24,9 @@ const RATE_PER_MIN: Record<string, number> = {
   "frontend-api-v3.pump.fun": 30,
   "api.rugcheck.xyz": 20,
   "api.fxtwitter.com": 20,
+  // Solana RPC: the free public endpoint is heavily rate-limited; a free Helius key allows far more.
+  "api.mainnet-beta.solana.com": 20,
+  "mainnet.helius-rpc.com": 240,
 };
 
 const hosts = new Map<string, HostState>();
@@ -107,6 +110,33 @@ export async function getJson<T = unknown>(
     const json = (await res.json()) as T;
     s.ok++;
     return json;
+  } catch (e) {
+    s.errors++;
+    s.lastError = e instanceof Error ? e.message : String(e);
+    throw e;
+  } finally {
+    release(s);
+  }
+}
+
+/** JSON-RPC call under the same per-host budget, concurrency and 429 handling as getJson. */
+export async function rpc<T = unknown>(url: string, method: string, params: unknown[], opts: { timeoutMs?: number } = {}): Promise<T> {
+  const s = host(url, 2);
+  await acquire(s);
+  try {
+    await takeToken(s);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000),
+    });
+    if (res.status === 429) s.pausedUntil = Date.now() + 30_000;
+    if (!res.ok) throw new HttpError(res.status, `${res.status} from ${new URL(url).host}`);
+    const json = (await res.json()) as { result?: T; error?: { message?: string } };
+    if (json.error) throw new Error(`RPC ${method}: ${json.error.message ?? "error"}`);
+    s.ok++;
+    return json.result as T;
   } catch (e) {
     s.errors++;
     s.lastError = e instanceof Error ? e.message : String(e);

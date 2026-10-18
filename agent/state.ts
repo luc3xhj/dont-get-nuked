@@ -3,10 +3,10 @@
 import { CONFIG } from "./config";
 import { db, journal, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
 import { budget } from "./http";
-import { dsQuotes, GT_URL, gtTrades, holderReport, pumpList, socialReport, tradePage } from "./sources";
+import { devReport, dsQuotes, GT_URL, gtTrades, holderReport, pumpList, socialReport, tradePage } from "./sources";
 import type { Analysis } from "./analyst";
 import type { SetupEval } from "./setups";
-import type { Coin, Features, HolderReport, Quote, ScreenResult, SocialReport, Trade } from "./types";
+import type { Coin, DevReport, Features, FundingReport, HolderReport, Quote, ScreenResult, SocialReport, Trade } from "./types";
 
 export type CoinState = {
   coin: Coin;
@@ -23,6 +23,8 @@ export type CoinState = {
   nextPollAt: number;
   holders: HolderReport | null;
   social: SocialReport | null;
+  dev: DevReport | null;
+  funding: FundingReport | null;
   quote: Quote | null;
   features: Features | null;
   screens: ScreenResult[];
@@ -56,6 +58,8 @@ function stateFor(coin: Coin): CoinState {
       nextPollAt: 0,
       holders: loadReport<HolderReport>(coin.mint, "holders"),
       social: loadReport<SocialReport>(coin.mint, "social"),
+      dev: loadReport<DevReport>(coin.mint, "dev"),
+      funding: loadReport<FundingReport>(coin.mint, "funding"),
       quote: null,
       features: null,
       screens: [],
@@ -286,6 +290,7 @@ export async function tapeTick(onUpdate: (s: CoinState) => void) {
 // Last attempt per mint, so a failing source isn't retried every tick.
 const holdersTried = new Map<string, number>();
 const socialTried = new Map<string, number>();
+const devTried = new Map<string, number>();
 
 export async function reportsTick() {
   const now = Date.now();
@@ -296,6 +301,9 @@ export async function reportsTick() {
   const socialDue = hot.filter((s) => due(socialTried, s.social?.at, CONFIG.socials.refreshMs, s.coin.mint)).slice(0, 3);
   for (const s of holderDue) holdersTried.set(s.coin.mint, now);
   for (const s of socialDue) socialTried.set(s.coin.mint, now);
+  // Creator history changes slowly; one lookup per coin per 30 minutes.
+  const devDue = hot.filter((s) => s.coin.creator && due(devTried, s.dev?.at, 30 * 60_000, s.coin.mint)).slice(0, 2);
+  for (const s of devDue) devTried.set(s.coin.mint, now);
   await Promise.all([
     ...holderDue.map(async (s) => {
       try {
@@ -303,6 +311,14 @@ export async function reportsTick() {
         saveReport(s.coin.mint, "holders", s.holders.at, s.holders);
       } catch {
         // Leave the old report; screens show it as stale/unknown.
+      }
+    }),
+    ...devDue.map(async (s) => {
+      try {
+        s.dev = await devReport(s.coin);
+        saveReport(s.coin.mint, "dev", s.dev.at, s.dev);
+      } catch {
+        // Unavailable: screens show developer history as unknown.
       }
     }),
     ...socialDue.map(async (s) => {
@@ -326,21 +342,13 @@ export async function quoteTick() {
   }
 }
 
-// ---------- creator history (observed only) ----------
+// ---------- creator history ----------
 
-const devCache = new Map<string, { at: number; coins: number; successes: number }>();
-
-/** Prior coins by this creator that we have seen, and how many did well (graduated or ATH ≥ $100k). */
-export function devHistory(creator: string, excludeMint: string) {
-  const hit = devCache.get(creator);
-  if (hit && Date.now() - hit.at < 5 * 60_000) return hit;
-  const rows = db.prepare("SELECT data FROM coins WHERE json_extract(data, '$.creator') = ?").all(creator) as { data: string }[];
-  const prior = rows.map((r) => JSON.parse(r.data) as Coin).filter((c) => c.mint !== excludeMint);
-  const out = {
-    at: Date.now(),
-    coins: prior.length,
-    successes: prior.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length,
-  };
-  devCache.set(creator, out);
-  return out;
+/** Prior launches by this coin's creator: pump.fun's record when we have it, else coins we've observed. */
+export function devHistory(s: CoinState) {
+  if (s.dev) return { coins: s.dev.launches, successes: s.dev.successes, successRate: s.dev.successRate, source: "pump.fun" as const };
+  const rows = db.prepare("SELECT data FROM coins WHERE json_extract(data, '$.creator') = ?").all(s.coin.creator) as { data: string }[];
+  const prior = rows.map((r) => JSON.parse(r.data) as Coin).filter((c) => c.mint !== s.coin.mint);
+  const successes = prior.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length;
+  return { coins: prior.length, successes, successRate: prior.length ? successes / prior.length : 0, source: "observed" as const };
 }

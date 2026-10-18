@@ -14,6 +14,10 @@ export const tregHealth = {
   failures: 0,
   disabled: null as string | null,
   lastError: null as string | null,
+  lastCallId: null as string | null,
+  lastCostMicro: null as number | null,
+  lastSuccessAt: null as number | null,
+  lastResultCount: null as number | null,
 };
 
 const priceChecked = new Map<string, number>();
@@ -48,20 +52,28 @@ export async function webSearch(query: string, opts: { domains?: string[]; purpo
       redirect: "error",
     });
     const cost = res.headers.get("X-Treg-Cost-Micro");
+    tregHealth.lastCallId = res.headers.get("X-Treg-Call-Id");
+    tregHealth.lastCostMicro = cost !== null && Number.isFinite(Number(cost)) ? Number(cost) : null;
     if (cost !== null && Number(cost) !== 0) {
       tregHealth.disabled = `A call reported a cost (${cost} micro-USD); Treg disabled until restart`;
       throw new Error(tregHealth.disabled);
     }
-    if (!res.ok) throw new Error(`Treg ${res.status}`);
+    if (!res.ok) throw new Error(`Treg ${res.status}${tregHealth.lastCallId ? ` (call ${tregHealth.lastCallId})` : ""}`);
+    if (res.headers.has("X-Treg-Upstream-Failed")) throw new Error("Treg upstream reported a failed search");
     const json = (await res.json()) as Record<string, unknown>;
     // TinyFish returns { results: [{ title, url, snippet|description|content }] }; be tolerant of shape.
-    const list = (json.results ?? json.data ?? json.items ?? []) as Record<string, unknown>[];
+    const list = json.results ?? json.data ?? json.items;
+    if (!Array.isArray(list)) throw new Error("Treg returned an unexpected search response");
+    if (list.some((r) => !r || typeof r !== "object")) throw new Error("Treg returned an invalid search result");
     tregHealth.lastError = null;
-    return list.slice(0, 8).map((r) => ({
+    tregHealth.lastSuccessAt = Date.now();
+    const results = list.slice(0, 8).map((r) => ({
       title: String(r.title ?? "").slice(0, 200),
       url: String(r.url ?? r.link ?? ""),
       snippet: String(r.snippet ?? r.description ?? r.content ?? "").slice(0, 400),
-    }));
+    })).filter((r) => /^https?:\/\//i.test(r.url));
+    tregHealth.lastResultCount = results.length;
+    return results;
   } catch (e) {
     tregHealth.failures++;
     tregHealth.lastError = e instanceof Error ? e.message : String(e);
@@ -134,6 +146,22 @@ export async function buildEvidence(s: CoinState) {
             : "narrative source (post doesn't mention this contract)",
     },
     tickerReuse: tickerReuse(c),
+    developer: s.dev && {
+      priorLaunches: s.dev.launches,
+      moreThanShown: s.dev.capped,
+      launchesLast24h: s.dev.launches24h,
+      graduated: s.dev.graduated,
+      successRate: round(s.dev.successRate),
+      bestAthUsd: Math.round(s.dev.bestAthUsd),
+      died: s.dev.died,
+    },
+    topHolderWallets: s.funding && {
+      checked: s.funding.checked,
+      underADayOld: s.funding.fresh,
+      freshWalletsHoldPct: round(s.funding.freshPct, 1),
+      largestSharedFunderClusterPct: round(s.funding.topClusterPct, 1),
+      exchangeFunded: s.funding.exchangeFunded,
+    },
     holders: s.holders && {
       totalHolders: s.holders.totalHolders,
       top10ExPoolPct: round(s.holders.top10ExPoolPct, 1),
