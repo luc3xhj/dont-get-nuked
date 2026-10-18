@@ -15,6 +15,7 @@ import { regime, regimeTick } from "./regime";
 import { walletsTick } from "./wallets";
 import { evidenceReport } from "./evidence";
 import { tregHealth } from "./research";
+import { researchReport } from "./research-report";
 import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio, walletSummary } from "./portfolio";
 import { evaluateSetups } from "./setups";
 import {
@@ -121,6 +122,11 @@ const server = createServer((req, res) => {
   if (url.pathname === "/api/wallet") return send(res, 200, walletSummary());
   if (url.pathname === "/api/dataset") return send(res, 200, datasetSummary());
   if (url.pathname === "/api/evidence") return send(res, 200, evidenceReport());
+  if (url.pathname === "/api/research") {
+    const mint = url.searchParams.get("mint");
+    if (mint && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) return send(res, 400, { error: "Invalid mint" });
+    return send(res, 200, researchReport(mint || undefined));
+  }
   if (url.pathname === "/api/dataset-csv") {
     res.writeHead(200, {
       "content-type": "text/csv",

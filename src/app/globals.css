@@ -3,6 +3,12 @@
 @theme inline {
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  /* Terminal surfaces */
+  --color-ink: #06070a;
+  --color-panel: #0b0d11;
+  --color-panel-2: #10131a;
+  --color-line: #1a1e27;
+  --color-line-2: #252a35;
 }
 
 :root {
@@ -10,11 +16,84 @@
 }
 
 body {
-  background: #09090b;
+  background: var(--color-ink);
   color: #e4e4e7;
 }
 
 .num {
   font-family: var(--font-geist-mono), ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
+}
+
+/* Small uppercase panel labels */
+.label {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #71717a;
+}
+
+/* Thin scrollbars inside panels */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: #2a2f3a transparent;
+}
+
+/* Price tick flashes */
+@keyframes flash-up {
+  from {
+    background-color: rgb(16 185 129 / 0.22);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+@keyframes flash-down {
+  from {
+    background-color: rgb(244 63 94 / 0.22);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+.flash-up {
+  animation: flash-up 0.9s ease-out;
+}
+.flash-down {
+  animation: flash-down 0.9s ease-out;
+}
+
+/* New activity entering the live feed */
+@keyframes enter {
+  from {
+    background-color: rgb(139 92 246 / 0.16);
+    transform: translateY(-4px);
+    opacity: 0;
+  }
+  to {
+    background-color: transparent;
+    transform: none;
+    opacity: 1;
+  }
+}
+.enter {
+  animation: enter 1.2s ease-out;
+}
+
+/* Status dots with a soft glow */
+.dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  box-shadow: 0 0 8px currentColor;
+  background: currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flash-up,
+  .flash-down,
+  .enter {
+    animation: none;
+  }
 }

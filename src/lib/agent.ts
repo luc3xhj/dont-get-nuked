@@ -83,6 +83,8 @@ export type WatchedCoin = {
   quote: Quote | null;
   curveProgress: number | null;
   social: Social;
+  dev?: { launches: number; capped: boolean; launches24h: number; graduated: number; successes: number; successRate: number; bestAthUsd: number; died: number } | null;
+  funding?: { checked: number; fresh: number; freshPct: number; clusters: { funder: string; wallets: string[]; pct: number }[]; topClusterPct: number; exchangeFunded: number } | null;
 };
 
 export type AgentState = {
@@ -90,8 +92,8 @@ export type AgentState = {
   startedAt: number;
   stats: { tracked: number; hot: number; tapePolls: number; tapeErrors: number; tradesIngested: number };
   http: Record<string, { ok: number; errors: number; pausedForMs: number; lastError: string | null }>;
-  analyst: { status: string; lastError: string | null; callsLastHour: number; maxPerHour: number; model: string; running: string | null };
-  treg: { configured: boolean; calls: number; failures: number; disabled: string | null; lastError: string | null };
+  analyst: { provider: "codex"; status: string; lastError: string | null; callsLastHour: number; maxPerHour: number; model: string; running: string | null };
+  treg: { configured: boolean; calls: number; failures: number; disabled: string | null; lastError: string | null; lastCallId: string | null; lastCostMicro: number | null; lastSuccessAt: number | null; lastResultCount: number | null };
   regime: Regime;
   hot: WatchedCoin[];
 };

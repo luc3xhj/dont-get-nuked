@@ -10,6 +10,8 @@ import type { Analysis } from "./analyst";
 import { regime } from "./regime";
 import { verdict } from "./screens";
 import { coins, type CoinState } from "./state";
+import { analysisKey, compareAnalysis } from "./analysis-impact";
+import type { AnalysisImpact } from "../src/lib/research-types";
 
 export type AccountId = "agent" | "shadow" | "baseline";
 
@@ -73,6 +75,9 @@ export type Position = {
   entryVetoes: string[];
   /** Analyst verdict when the position opened ("none" if there wasn't a fresh one). */
   analystAtEntry: Analysis["verdict"] | "none";
+  entryAnalysisId?: string | null;
+  entryDecisionId?: string;
+  exitAnalysisId?: string | null;
   evidence: string[];
   exiting: boolean;
 };
@@ -94,10 +99,16 @@ export type Closed = {
   exitReason: string;
   holdMin: number;
   analystAtEntry: Analysis["verdict"] | "none";
+  entryAnalysisId?: string | null;
+  entryDecisionId?: string;
+  exitAnalysisId?: string | null;
 };
 
 type Order = {
   id: string;
+  decisionId?: string;
+  analysisId?: string | null;
+  analystVerdict?: Analysis["verdict"] | "none";
   account: AccountId;
   mint: string;
   side: "buy" | "sell";
@@ -238,16 +249,19 @@ export function setupEvidence(setup: SetupId) {
 
 // ---------- entries ----------
 
-const freshAnalysis = (s: CoinState) => (s.analysis && s.analysis.expiresAt > Date.now() ? s.analysis : null);
+const freshAnalysis = (s: CoinState, now = Date.now()) => (s.analysis && s.analysis.expiresAt > now ? s.analysis : null);
 
 const uid = () => crypto.randomUUID();
 const openFor = (account: AccountId, mint: string) => [...positions.values()].some((p) => p.account === account && p.mint === mint);
 const pendingFor = (account: AccountId, mint: string) => orders.some((o) => o.account === account && o.mint === mint);
 
-function placeBuy(account: AccountId, s: CoinState, solIn: number, setup: SetupId | "random", plan: Plan, evidence: string[], reason: string) {
+function placeBuy(account: AccountId, s: CoinState, solIn: number, setup: SetupId | "random", plan: Plan, evidence: string[], reason: string, decision?: Decision) {
   const now = Date.now();
   const o: Order = {
     id: uid(),
+    decisionId: decision?.id,
+    analysisId: decision?.impact.analysisId,
+    analystVerdict: decision?.analyst.verdict,
     account,
     mint: s.coin.mint,
     side: "buy",
@@ -261,10 +275,12 @@ function placeBuy(account: AccountId, s: CoinState, solIn: number, setup: SetupI
     reason,
   };
   orders.push(o);
-  journal("order", s.coin.mint, { account, side: "buy", solIn, setup, plan, reason });
+  journal("order", s.coin.mint, { id: o.id, decisionId: o.decisionId, analysisId: o.analysisId, account, side: "buy", solIn, setup, plan, reason });
 }
 
 export type Decision = {
+  id: string;
+  impact: AnalysisImpact;
   take: boolean;
   sizeSol: number;
   reasons: string[];
@@ -279,6 +295,7 @@ export type Decision = {
 /** The agent's judgment on a fired setup. Every reason is journaled for calibration. */
 export function decide(s: CoinState, ev: SetupEval): Decision {
   const a = accounts.get("agent")!;
+  const now = Date.now();
   const reasons: string[] = [];
   const plan = ev.plan!;
   const risk = (plan.entrySol - plan.stopSol) / plan.entrySol;
@@ -305,28 +322,33 @@ export function decide(s: CoinState, ev: SetupEval): Decision {
 
   // Size from risk: lose ~riskPerTrade of equity if the stop is hit (with gap) and costs are paid.
   // The analyst's slow-lane judgment: a reject blocks, conviction scales size, no verdict trades half size.
-  const an = freshAnalysis(s);
+  const an = freshAnalysis(s, now);
   const analyst = an
     ? { verdict: an.verdict, conviction: an.conviction, note: an.verdict === "reject" ? (an.redFlags[0] ?? an.thesis) : an.narrative }
     : { verdict: "none" as const, conviction: RISK.noAnalysisScale, note: "No fresh analyst verdict" };
-  if (an?.verdict === "reject") reasons.push(`Analyst rejected: ${analyst.note}`);
   // Market regime: don't trade into a bad tape; half size when it's shaky.
   if (regime.level === "bad") reasons.push(`Market regime bad: ${regime.reasons.join("; ")}`);
   const regimeScale = regime.level === "caution" ? 0.5 : 1;
-  const riskScale = (mode === "explore" ? RISK.explorationRiskScale : 1) * analyst.conviction * regimeScale;
-  let size = (equity * RISK.riskPerTrade * riskScale) / (risk * RISK.stopGap + roundTripCost(s, 0.5));
-  size = Math.min(size, equity * RISK.maxPositionFraction, maxSizeForImpact(s, RISK.maxImpact), a.cash * 0.95);
-  if (size < RISK.minOrderSol) reasons.push(`Size ${size.toFixed(3)}◎ below minimum (thin pool or little cash)`);
+  const cost = roundTripCost(s, 0.5);
+  const sizeCap = Math.min(equity * RISK.maxPositionFraction, maxSizeForImpact(s, RISK.maxImpact), a.cash * 0.95);
+  const sizeFor = (conviction: number) => Math.min(
+    (equity * RISK.riskPerTrade * (mode === "explore" ? RISK.explorationRiskScale : 1) * conviction * regimeScale) / (risk * RISK.stopGap + cost),
+    sizeCap,
+  );
 
   // Realized shadow R already includes every cost; until there is enough of it, explore small.
   const evFrac = evd.shrunkR * risk;
   if (mode === "evidence" && evd.shrunkR < RISK.minEdgeR)
     reasons.push(`No edge yet: shadow avg ${evd.avgR.toFixed(2)}R over ${evd.n} trades (${(evd.winRate * 100).toFixed(0)}% wins)`);
 
+  const { actual, impact } = compareAnalysis({
+    mint: s.coin.mint, analysis: s.analysis, now, commonReasons: reasons, sizeFor,
+    defaultScale: RISK.noAnalysisScale, minimum: RISK.minOrderSol,
+  });
   return {
-    take: reasons.length === 0,
-    sizeSol: size,
-    reasons,
+    id: uid(),
+    impact,
+    ...actual,
     ev: evFrac,
     p: evd.winRate,
     mode,
@@ -376,6 +398,7 @@ export function onSignals(s: CoinState, fired: SetupEval[]) {
           ev.plan,
           evidence,
           `${SETUP_LABEL[ev.setup]} · ${d.mode === "explore" ? "exploring" : `edge ${(d.ev * 100).toFixed(1)}%`}`,
+          d,
         );
     }
   }
@@ -420,6 +443,9 @@ function closePosition(p: Position, reason: string) {
     exitReason: reason,
     holdMin: (Date.now() - p.openedAt) / 60_000,
     analystAtEntry: p.analystAtEntry ?? "none",
+    entryAnalysisId: p.entryAnalysisId,
+    entryDecisionId: p.entryDecisionId,
+    exitAnalysisId: p.exitAnalysisId,
   };
   db.prepare("INSERT OR REPLACE INTO closed (id, account, setup, closed_at, data) VALUES (?, ?, ?, ?, ?)").run(
     c.id,
@@ -446,6 +472,7 @@ function processOrders() {
     const expired = now - o.createdAt > 30_000;
     if (!s) {
       orders.splice(i, 1);
+      journal("order_expired", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: o.side, reason: "Coin no longer tracked" });
       continue;
     }
     if (o.side === "buy") {
@@ -453,7 +480,7 @@ function processOrders() {
       if (fill === "wait") {
         if (expired) {
           orders.splice(i, 1);
-          journal("order_expired", o.mint, { account: o.account, side: "buy" });
+          journal("order_expired", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy" });
         }
         continue;
       }
@@ -461,7 +488,7 @@ function processOrders() {
       if (!fill.ok) {
         a.cash -= fill.feeSol;
         saveAccount(a);
-        journal("fill_failed", o.mint, { account: o.account, side: "buy", reason: fill.reason });
+        journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy", reason: fill.reason });
         continue;
       }
       a.cash -= fill.sol;
@@ -485,13 +512,15 @@ function processOrders() {
         highSol: fill.priceSol,
         liquidityAtEntry: s.quote?.liquidityUsd || null,
         entryVetoes: s.screens.filter((x) => x.level === "veto").map((x) => x.id),
-        analystAtEntry: freshAnalysis(s)?.verdict ?? "none",
+        analystAtEntry: o.account === "agent" ? (o.analystVerdict ?? "none") : (freshAnalysis(s)?.verdict ?? "none"),
+        entryAnalysisId: o.analysisId,
+        entryDecisionId: o.decisionId,
         evidence: o.evidence ?? [],
         exiting: false,
       };
       positions.set(p.id, p);
       savePosition(p);
-      journal("fill", o.mint, { account: o.account, side: "buy", sol: fill.sol, tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact });
+      journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "buy", sol: fill.sol, tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact });
     } else {
       const p = positions.get(o.positionId!);
       if (!p) {
@@ -505,7 +534,9 @@ function processOrders() {
           // No price for 5 minutes: treat as untradeable and write it off rather than inventing a fill.
           orders.splice(i, 1);
           p.tokens = 0;
+          p.exitAnalysisId = o.analysisId;
           closePosition(p, `${o.reason} (no price — written off)`);
+          journal("order_expired", o.mint, { orderId: o.id, account: o.account, side: "sell", reason: "No price; position written off without a fill" });
         }
         continue;
       }
@@ -514,7 +545,7 @@ function processOrders() {
         a.cash -= fill.feeSol;
         p.exiting = false; // retry on the next tick
         saveAccount(a);
-        journal("fill_failed", o.mint, { account: o.account, side: "sell", reason: fill.reason });
+        journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "sell", reason: fill.reason });
         continue;
       }
       a.cash += fill.sol;
@@ -522,18 +553,22 @@ function processOrders() {
       p.tokens -= tokensIn;
       p.exiting = false;
       saveAccount(a);
-      journal("fill", o.mint, { account: o.account, side: "sell", sol: fill.sol, tokens: tokensIn, priceSol: fill.priceSol, reason: o.reason });
-      if (p.tokens <= p.initialTokens * 1e-6) closePosition(p, o.reason);
+      journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "sell", sol: fill.sol, tokens: tokensIn, priceSol: fill.priceSol, reason: o.reason });
+      if (p.tokens <= p.initialTokens * 1e-6) { p.exitAnalysisId = o.analysisId; closePosition(p, o.reason); }
       else savePosition(p);
     }
   }
 }
 
-function placeSell(p: Position, fraction: number, reason: string) {
+function placeSell(p: Position, fraction: number, reason: string, analysisId: string | null = null, withoutExitReason: string | null = null) {
   const now = Date.now();
   p.exiting = true;
+  const decisionId = uid();
+  const orderId = uid();
   orders.push({
-    id: uid(),
+    id: orderId,
+    decisionId,
+    analysisId,
     account: p.account,
     mint: p.mint,
     side: "sell",
@@ -543,6 +578,11 @@ function placeSell(p: Position, fraction: number, reason: string) {
     tokensIn: fraction >= 0.999 ? p.tokens : p.tokens * fraction,
     positionId: p.id,
     reason,
+  });
+  journal("order", p.mint, { id: orderId, decisionId, analysisId, positionId: p.id, account: p.account, side: "sell", reason });
+  if (analysisId) journal("exit_decision", p.mint, {
+    id: decisionId, analysisId, orderId, positionId: p.id, account: p.account, reason,
+    effect: withoutExitReason ? "exit_unchanged" : "exit_requested", withoutExitReason,
   });
 }
 
@@ -580,8 +620,10 @@ function manage(p: Position) {
   const newVeto = s.screens.find((x) => x.level === "veto" && THESIS_VETOES.has(x.id) && !(p.entryVetoes ?? []).includes(x.id));
   if (newVeto) return placeSell(p, 1, `New veto: ${newVeto.label}`);
   const an = freshAnalysis(s);
-  if (p.account === "agent" && an?.verdict === "reject" && an.at > p.openedAt) return placeSell(p, 1, "Analyst turned negative");
-  if (p.liquidityAtEntry && s.quote.liquidityUsd && s.quote.liquidityUsd < p.liquidityAtEntry * 0.6) return placeSell(p, 1, "Liquidity pulled");
+  const liquidityPulled = p.liquidityAtEntry && s.quote.liquidityUsd && s.quote.liquidityUsd < p.liquidityAtEntry * 0.6;
+  if (p.account === "agent" && an?.verdict === "reject" && an.at > p.openedAt)
+    return placeSell(p, 1, "Analyst turned negative", analysisKey(p.mint, an), liquidityPulled ? "Liquidity pulled" : null);
+  if (liquidityPulled) return placeSell(p, 1, "Liquidity pulled");
 }
 
 /** Screen vetoes that break a held position's thesis if they appear after entry. */

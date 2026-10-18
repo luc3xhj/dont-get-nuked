@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "node --import tsx --test agent/*.test.ts",
+    "research:check": "node --env-file-if-exists=.env.local --import tsx scripts/check-research.ts",
     "agent": "node --env-file-if-exists=.env.local --import tsx agent/main.ts",
     "agent:install": "node scripts/agent-service.mjs install",
     "agent:start": "node scripts/agent-service.mjs start",

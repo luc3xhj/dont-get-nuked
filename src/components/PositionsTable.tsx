@@ -31,7 +31,7 @@ export function OpenPositions({ positions }: { positions: OpenPosition[] }) {
             return (
               <tr key={p.id} className="border-t border-zinc-900" title={p.evidence.join("\n")}>
                 <td className="px-4 py-2">
-                  <Link href={`/coin/${p.mint}`} className="flex items-center gap-2.5 hover:underline">
+                  <Link href={`/?coin=${p.mint}`} className="flex items-center gap-2.5 hover:underline">
                     <TokenIcon src={coinImage(p.mint)} symbol={p.symbol} size={28} />
                     <div>
                       <div className="font-semibold text-white">{p.symbol}</div>
@@ -74,7 +74,7 @@ export function ClosedTrades({ trades, showAccount = false }: { trades: ClosedTr
               <td className="px-4 py-2 text-zinc-500">{fmtAge(c.closedAt)} ago</td>
               {showAccount && <td className="px-3 py-2 capitalize text-zinc-400">{c.account}</td>}
               <td className="px-3 py-2">
-                <Link href={`/coin/${c.mint}`} className="font-semibold text-white hover:underline">
+                <Link href={`/?coin=${c.mint}`} className="font-semibold text-white hover:underline">
                   {c.symbol}
                 </Link>
               </td>

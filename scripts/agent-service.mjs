@@ -32,7 +32,7 @@ function writePlist() {
   mkdirSync(logs, { recursive: true });
   if (existsSync(plist) && !readFileSync(plist, "utf8").includes(xml(root))) throw new Error("Existing service belongs to another directory");
   // `node --import tsx` runs the TypeScript worker in a single process launchd can supervise.
-  // Credentials (TREG_TOKEN, CLAUDE_BIN, …) come from .env.local, never from the plist.
+  // Credentials/settings (TREG_TOKEN, CODEX_BIN, …) come from .env.local, never from the plist.
   const args = [process.execPath, `--env-file-if-exists=${resolve(root, ".env.local")}`, "--import", "tsx", resolve(root, "agent/main.ts")];
   writeFileSync(
     plist,
