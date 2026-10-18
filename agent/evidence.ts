@@ -42,6 +42,11 @@ const FEATURES: { key: string; label: string; value: (f: Record<string, unknown>
   { key: "wash", label: "Wash score", value: (f) => get(f, "volume.washScore") },
   { key: "top10Vol", label: "Top-10 wallets' volume share", value: (f) => get(f, "volume.top10VolShare") },
   { key: "age", label: "Coin age (min)", value: (f) => get(f, "ageMin") },
+  { key: "trackedTraders", label: "Watched + discovered traders holding", value: (f) => {
+    const w = get(f, "tracked.watching");
+    const d = get(f, "tracked.discovered");
+    return w === null && d === null ? null : (w ?? 0) + (d ?? 0);
+  } },
 ];
 
 const versionOf = (c: Closed) => c.version ?? "legacy";

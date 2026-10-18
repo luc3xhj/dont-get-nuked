@@ -143,6 +143,7 @@ export type CoinDetail =
       tracked: true;
       fills: Fill[];
       recentTrades: TapeTrade[];
+      traders?: TraderOnCoin[];
       holdersReport: { top: { owner: string; pct: number; insider: boolean }[]; totalHolders: number | null } | null;
     })
   | {
@@ -252,7 +253,7 @@ export type ActivityItem = {
   ts: number;
   mint: string | null;
   symbol: string | null;
-  tone: "buy" | "sell" | "win" | "loss" | "setup" | "pass" | "analyst" | "system";
+  tone: "buy" | "sell" | "win" | "loss" | "setup" | "pass" | "analyst" | "system" | "trader";
   title: string;
   detail: string;
 };
@@ -287,3 +288,117 @@ export const coinImage = (mint: string) => `https://images.pump.fun/coin-image/$
 
 export const solSigned = (v: number, d = 3) => `${v >= 0 ? "+" : ""}${v.toFixed(d)}◎`;
 export const pctSigned = (v: number, d = 0) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(d)}%`;
+
+/** A watched or discovered wallet's position in one coin, computed from the tape. */
+export type TraderOnCoin = {
+  address: string;
+  name: string | null;
+  xHandle: string | null;
+  source: "watching" | "discovered";
+  firstBuyAt: number;
+  entryMcapUsd: number | null;
+  multiple: number | null;
+  holdingPct: number;
+  solIn: number;
+  solOut: number;
+  pnlSol: number | null;
+  lastAction: "buy" | "sell";
+  lastActionAt: number;
+  complete: boolean;
+  actions: { ts: number; side: "buy" | "sell"; sol: number }[];
+};
+
+export type DiscoveredWallet = {
+  address: string;
+  closed: number;
+  wins: number;
+  winRateLower: number;
+  realizedSol: number;
+  returnOnCost?: number;
+  avgHoldMin?: number;
+  coins: number;
+  lastActiveAt: number;
+  score: number;
+};
+
+export type TradersReport = {
+  discovery: { minClosed: number; ranked: number; top: number };
+  watching: {
+    address: string;
+    name: string;
+    xHandle: string | null;
+    note: string;
+    addedAt: number;
+    coinsSeen: number;
+    lastActiveAt: number | null;
+    lastMint: string | null;
+    discovered: DiscoveredWallet | null;
+  }[];
+  discovered: (DiscoveredWallet & { watching: boolean })[];
+};
+
+export const shortAddr = (a: string) => `${a.slice(0, 4)}…${a.slice(-4)}`;
+
+// ---------- Pulse (Axiom-style coin list) ----------
+
+export type PulseRange = { min: number | null; max: number | null };
+export type PulseRangeKey =
+  | "age"
+  | "top10Holders"
+  | "devHolding"
+  | "snipers"
+  | "insiders"
+  | "bundle"
+  | "holders"
+  | "bondingCurve"
+  | "liquidity"
+  | "volume"
+  | "marketCap"
+  | "txns"
+  | "numBuys"
+  | "numSells";
+export type PulseFlagKey = "twitter" | "website" | "telegram" | "dexPaid" | "anySocial";
+export type PulseFilters = Record<PulseRangeKey, PulseRange> & Record<PulseFlagKey, boolean> & { searchKeywords: string[]; excludeKeywords: string[] };
+export type PulseMetrics = {
+  ageMin: number;
+  marketCap: number | null;
+  bondingCurve: number | null;
+  athMcap: number | null;
+  liquidity: number | null;
+  volume: number | null;
+  txns: number | null;
+  numBuys: number | null;
+  numSells: number | null;
+  holders: number | null;
+  top10Holders: number | null;
+  devHolding: number | null;
+  insiders: number | null;
+  snipers: number | null;
+  bundle: number | null;
+  dexPaid: boolean | null;
+  twitter: boolean;
+  website: boolean;
+  telegram: boolean;
+};
+export type PulseColumnId = "newPairs" | "finalStretch" | "migrated";
+export type PulseCoin = {
+  mint: string;
+  symbol: string;
+  name: string;
+  createdAt: number;
+  hot: boolean;
+  status: "pass" | "checking";
+  failed: string[];
+  unknown: string[];
+  metrics: PulseMetrics;
+};
+export type PulseColumn = {
+  id: PulseColumnId;
+  label: string;
+  filters: PulseFilters;
+  preset: PulseFilters;
+  counts: { seen: number; pass: number; checking: number; fail: number };
+  failReasons: Record<string, number>;
+  coins: PulseCoin[];
+};
+export type PulseReport = { at: number; note: string; labels: Record<string, string>; columns: PulseColumn[] };

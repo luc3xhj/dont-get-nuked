@@ -4,10 +4,10 @@ import { SETUP_LABEL, type SetupId } from "./setups";
 import { coins } from "./state";
 import type { Coin } from "./types";
 
-export type ActivityTone = "buy" | "sell" | "win" | "loss" | "setup" | "pass" | "analyst" | "system";
+export type ActivityTone = "buy" | "sell" | "win" | "loss" | "setup" | "pass" | "analyst" | "system" | "trader";
 export type ActivityItem = { seq: number; ts: number; mint: string | null; symbol: string | null; tone: ActivityTone; title: string; detail: string };
 
-const KINDS = ["armed", "signal", "decision", "fill", "fill_failed", "order_expired", "close", "analysis", "risk_pause", "control", "start"];
+const KINDS = ["armed", "signal", "decision", "fill", "fill_failed", "order_expired", "close", "analysis", "risk_pause", "control", "start", "trader_trade"];
 const setupName = (s: string) => SETUP_LABEL[s as SetupId] ?? (s === "random" ? "Random control" : s);
 const signed = (v: number, d = 3) => `${v >= 0 ? "+" : ""}${v.toFixed(d)}◎`;
 
@@ -72,6 +72,15 @@ function describe(kind: string, d: any): Pick<ActivityItem, "tone" | "title" | "
       return agentOnly ? null : { tone: "system", title: "Risk pause", detail: d.reason };
     case "control":
       return { tone: "system", title: d.action === "pause" ? "Paused by you" : "Resumed by you", detail: "" };
+    case "trader_trade": {
+      const who = d.name ?? `${String(d.wallet).slice(0, 4)}…${String(d.wallet).slice(-4)}`;
+      const mcap = d.mcapUsd ? ` at $${Math.round(d.mcapUsd / 1000)}k mcap` : "";
+      return {
+        tone: "trader",
+        title: `${who} ${d.side === "buy" ? "bought" : "sold"} ${Number(d.sol).toFixed(2)}◎`,
+        detail: `${d.source === "watching" ? "Watched trader" : "Discovered trader"}${d.xHandle ? ` @${d.xHandle}` : ""}${mcap}`,
+      };
+    }
     case "start":
       return { tone: "system", title: "Agent started", detail: "Restored wallet, positions and history" };
   }

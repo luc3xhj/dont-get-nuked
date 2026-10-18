@@ -1,6 +1,7 @@
 // Deterministic features computed from a coin's trade tape. All prices in SOL.
 import { CONFIG } from "./config";
 import type { CoinState } from "./state";
+import { trackedHolding } from "./traders";
 import type { Cohort, Features, Flow, Trade, VolumeQuality } from "./types";
 
 const median = (xs: number[]) => {
@@ -300,6 +301,7 @@ export function computeFeatures(s: CoinState, now = Date.now()): Features | null
     highScope: s.fromLaunch ? "launch" : "observed",
     tapeGaps: s.tapeGaps,
     cohortsReliable: s.fromLaunch && s.tapeGaps === 0,
+    tracked: trackedHolding(s),
     migratedAgeMin: s.coin.stage === "migrated" && s.coin.migratedAt ? (now - s.coin.migratedAt) / 60_000 : null,
   };
 }

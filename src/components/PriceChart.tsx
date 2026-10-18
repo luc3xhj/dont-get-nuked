@@ -19,7 +19,7 @@ const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"] as const;
 type Tf = (typeof TIMEFRAMES)[number];
 const BUCKET: Record<Tf, number> = { "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400 };
 
-export type TradeMarker = { ts: number; side: "buy" | "sell"; label?: string };
+export type TradeMarker = { ts: number; side: "buy" | "sell"; label?: string; color?: string };
 
 export default function PriceChart({ pairAddress, livePrice, markers = [] }: { pairAddress: string; livePrice: number; markers?: TradeMarker[] }) {
   const el = useRef<HTMLDivElement>(null);
@@ -61,7 +61,7 @@ export default function PriceChart({ pairAddress, livePrice, markers = [] }: { p
   }, []);
 
   // The agent's fills, snapped to the candle they happened in.
-  const markerKey = markers.map((m) => `${m.ts}${m.side}`).join(",");
+  const markerKey = markers.map((m) => `${m.ts}${m.side}${m.label ?? ""}`).join(",");
   useEffect(() => {
     if (!markerApi.current || status !== "ready") return;
     const bucket = BUCKET[tf];
@@ -72,7 +72,7 @@ export default function PriceChart({ pairAddress, livePrice, markers = [] }: { p
           time: (Math.floor(m.ts / 1000 / bucket) * bucket) as UTCTimestamp,
           position: m.side === "buy" ? ("belowBar" as const) : ("aboveBar" as const),
           shape: m.side === "buy" ? ("arrowUp" as const) : ("arrowDown" as const),
-          color: m.side === "buy" ? "#34d399" : "#fb7185",
+          color: m.color ?? (m.side === "buy" ? "#34d399" : "#fb7185"),
           text: m.label ?? (m.side === "buy" ? "B" : "S"),
         })),
     );

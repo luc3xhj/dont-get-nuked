@@ -6,6 +6,8 @@ import EvidencePanel from "../EvidencePanel";
 import { ClosedTrades, OpenPositions } from "../PositionsTable";
 import { AnalysisCard, CHANGED, DecisionCard } from "../research/ResearchCards";
 import { useTerminal } from "./data";
+import { TradersTab } from "./Traders";
+import { Metric } from "./ui";
 import type { DockTab, Layout } from "./layout";
 import { pctSigned, SETUP_LABEL, type Account, type DatasetSummary, type Stats } from "@/lib/agent";
 import { fmtAge, pnlColor } from "@/lib/format";
@@ -17,6 +19,7 @@ const TABS: { id: DockTab; label: string }[] = [
   { id: "trades", label: "Trades" },
   { id: "decisions", label: "Decisions" },
   { id: "research", label: "Research audit" },
+  { id: "traders", label: "Traders" },
   { id: "performance", label: "Performance" },
   { id: "evidence", label: "What predicts winners" },
   { id: "dataset", label: "Rug dataset" },
@@ -205,23 +208,19 @@ function ResearchAudit() {
   const list = changedOnly ? changed : data.decisions;
   return (
     <div className="space-y-3 p-3">
-      <div className="num flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-zinc-400">
-        <span>
-          <span className="text-zinc-500">reports</span> {data.analyses.length}
-        </span>
-        <span>
-          <span className="text-zinc-500">decisions using analysis</span> {data.decisions.filter((x) => x.analysisId).length}
-        </span>
-        <span>
-          <span className="text-zinc-500">changed by analysis</span> {changed.length}
-        </span>
-        <label className="ml-auto flex cursor-pointer items-center gap-1.5">
+      <div className="flex flex-wrap items-stretch gap-2">
+        <div className="grid min-w-[16rem] flex-1 grid-cols-3 gap-2 sm:max-w-md">
+          <Metric label="Reports · 7d" value={data.analyses.length} />
+          <Metric label="Used in decisions" value={data.decisions.filter((x) => x.analysisId).length} />
+          <Metric label="Changed" value={changed.length} tone={changed.length ? "info" : undefined} />
+        </div>
+        <label className="ml-auto flex cursor-pointer items-center gap-1.5 self-center text-xs text-zinc-400">
           <input type="checkbox" checked={changedOnly} onChange={(e) => setChangedOnly(e.target.checked)} className="accent-violet-500" />
-          Changed only
+          Only decisions research changed
         </label>
       </div>
-      <p className="text-[11px] text-zinc-600">
-        Each comparison holds the market, risk limits and setup fixed, replacing analysis with the default 0.5× size. Research never creates a setup.
+      <p className="text-[11px] text-zinc-500">
+        &ldquo;Without analysis&rdquo; replays the same moment with the default 0.5× size and no verdict; the market, risk limits and setup are unchanged. Research never creates a setup.
       </p>
       <div className="grid items-start gap-3 lg:grid-cols-2">
         <div className="space-y-2">
@@ -316,6 +315,7 @@ export default function Dock({ layout, update, onSelect }: { layout: Layout; upd
         )}
         {layout.dockTab === "decisions" && <Decisions onSelect={onSelect} />}
         {layout.dockTab === "research" && <ResearchAudit />}
+        {layout.dockTab === "traders" && <TradersTab onSelect={onSelect} />}
         {layout.dockTab === "performance" && <Performance />}
         {layout.dockTab === "evidence" && <EvidencePanel />}
         {layout.dockTab === "dataset" && <Dataset />}

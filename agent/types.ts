@@ -56,6 +56,19 @@ export type Quote = {
   pairCreatedAt?: number | null;
 };
 
+/** Pair activity from DexScreener (used by the Pulse list filters). */
+export type PairMarket = {
+  at: number;
+  volumeUsd: { m5: number; h1: number; h24: number };
+  buys: { m5: number; h1: number; h24: number };
+  sells: { m5: number; h1: number; h24: number };
+  liquidityUsd: number;
+  mcapUsd: number;
+  dexPaid: boolean;
+  /** DexScreener hasn't indexed this pair yet (all activity numbers are zero). */
+  missing?: boolean;
+};
+
 export type Holder = { owner: string; pct: number; insider: boolean };
 
 export type HolderReport = {
@@ -189,6 +202,8 @@ export type Features = {
   cohortsReliable: boolean;
   /** Minutes since migration, or null if unknown (never inferred from creation time). */
   migratedAgeMin: number | null;
+  /** Watched and discovered traders still holding, from the tape (a lower bound if the tape is partial). */
+  tracked: { watching: number; discovered: number; heldPct: number };
 };
 
 export type ScreenLevel = "veto" | "warn" | "ok" | "unknown";
