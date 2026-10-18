@@ -29,7 +29,7 @@ export type Analysis = {
 };
 
 export const ANALYST = {
-  model: process.env.ANALYST_MODEL || "codex-default",
+  model: process.env.ANALYST_MODEL || "gpt-6.1-sol",
   maxPerHour: Number(process.env.ANALYST_MAX_PER_HOUR ?? 20),
   timeoutMs: 150_000,
   /** Don't re-ask about the same coin sooner than this unless it's held. */
@@ -101,7 +101,7 @@ export function runAnalyst(prompt: string) {
   return runCodex(prompt, {
     schema: ANALYSIS_SCHEMA,
     instructions: SYSTEM + "\nUse only the supplied evidence. Do not call tools, browse, read files, or change anything.",
-    model: process.env.ANALYST_MODEL || undefined,
+    model: ANALYST.model,
     timeoutMs: ANALYST.timeoutMs,
   });
 }

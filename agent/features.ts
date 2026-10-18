@@ -296,5 +296,10 @@ export function computeFeatures(s: CoinState, now = Date.now()): Features | null
     liquidityUsd: s.coin.stage === "migrated" ? (q?.liquidityUsd ?? null) : null,
     tapeTrades: trades.length,
     tapeFromLaunch: s.fromLaunch,
+    observedMin: (now - trades[0].ts) / 60_000,
+    highScope: s.fromLaunch ? "launch" : "observed",
+    tapeGaps: s.tapeGaps,
+    cohortsReliable: s.fromLaunch && s.tapeGaps === 0,
+    migratedAgeMin: s.coin.stage === "migrated" && s.coin.migratedAt ? (now - s.coin.migratedAt) / 60_000 : null,
   };
 }

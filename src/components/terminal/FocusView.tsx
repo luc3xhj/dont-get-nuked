@@ -90,6 +90,7 @@ function FlowBox({ label, f }: { label: string; f: Flow }) {
 }
 
 const ago = (ts: number) => `${fmtAge(ts)} ago`;
+const fmtMin = (m: number) => (m >= 90 ? `${(m / 60).toFixed(1)}h` : `${Math.round(m)}m`);
 
 export default function FocusView({ mint, open, onToggle }: { mint: string | null; open: string[]; onToggle: (id: string) => void }) {
   const { state, portfolio } = useTerminal();
@@ -178,7 +179,8 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
             <div className="text-[11px] text-zinc-500">
               mcap {fmtCompact(live.quote.mcapUsd)}
               {live.quote.liquidityUsd > 0 && ` · liq ${fmtCompact(live.quote.liquidityUsd)}`}
-              {f && ` · ${(f.drawdown * 100).toFixed(0)}% off ATH`}
+              {f && ` · ${(f.drawdown * 100).toFixed(0)}% off ${f.highScope === "observed" ? "observed high" : "ATH"}`}
+              {f?.migratedAgeMin != null && ` · migrated ${fmtMin(f.migratedAgeMin)} ago`}
             </div>
           </div>
         )}
@@ -271,7 +273,30 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
                   {x.analyst.conviction.toFixed(2)}
                   {x.regime && ` · regime ${x.regime.level}`}
                 </div>
+                {x.costs && (
+                  <div className="num mt-0.5 text-zinc-500">
+                    round trip {(x.costs.roundTripCostPct * 100).toFixed(1)}% · impact {(x.costs.entryImpact * 100).toFixed(2)}% · TP1 net{" "}
+                    <span className="text-emerald-300/80">
+                      {x.costs.tp1NetSol >= 0 ? "+" : ""}
+                      {x.costs.tp1NetSol.toFixed(4)}◎
+                    </span>{" "}
+                    · stop net <span className="text-rose-300/80">{x.costs.stopNetSol.toFixed(4)}◎</span> · net R/R {x.costs.netRewardRisk.toFixed(2)}
+                  </div>
+                )}
                 {x.reasons.length > 0 && <div className="mt-0.5 text-zinc-400">{x.reasons.join(" · ")}</div>}
+                {x.essentials && x.essentials.length > 0 && (
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {x.essentials.map((e) => (
+                      <span
+                        key={e.id}
+                        title={e.detail}
+                        className={`rounded border px-1.5 py-0.5 text-[10px] ${e.ok ? "border-emerald-900 text-emerald-300/80" : "border-amber-900 text-amber-300"}`}
+                      >
+                        {e.ok ? "✓" : "?"} {e.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -292,6 +317,13 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
                   <div className={`mb-1 font-semibold ${x.status === "fire" ? "text-emerald-300" : "text-violet-300"}`}>
                     {x.status === "fire" ? "Firing" : "Armed"}: {SETUP_LABEL[x.setup] ?? x.setup}
                   </div>
+                  {x.episode && (
+                    <div className="num mb-1 text-[11px] text-zinc-500">
+                      {x.episode.state === "cooldown"
+                        ? `Cooling down after a failed episode · signals resume ${x.episode.cooldownUntil ? `in ${fmtMin(Math.max(0, (x.episode.cooldownUntil - Date.now()) / 60_000))}` : "soon"}`
+                        : `Armed ${ago(x.episode.armedAt)}${x.episode.firedAt ? ` · fired ${ago(x.episode.firedAt)}` : ""}`}
+                    </div>
+                  )}
                   {[...x.structure, ...x.trigger].map((k) => (
                     <div key={k.label} className="flex justify-between gap-2">
                       <span className={k.ok ? "text-zinc-300" : "text-zinc-500"}>
@@ -323,9 +355,10 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
                 .sort((a, b) => ["veto", "warn", "unknown", "ok"].indexOf(a.level) - ["veto", "warn", "unknown", "ok"].indexOf(b.level))
                 .map((x) => (
                   <div key={x.id} className="flex items-start gap-2 text-xs">
-                    <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] ${SCREEN_TONE[x.level]}`}>{x.level}</span>
+                    <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] ${SCREEN_TONE[x.level]}`}>{x.status === "stale" ? "stale" : x.level}</span>
                     <span className="text-zinc-300">
                       <b className="font-medium text-white">{x.label}:</b> {x.detail}
+                      {x.observedAt && x.status !== "stale" && <span className="num text-zinc-600"> · {ago(x.observedAt)}</span>}
                     </span>
                   </div>
                 ))}
@@ -443,6 +476,11 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
                       {live.dev.launches}
                       {live.dev.capped ? "+" : ""} prior launches ({live.dev.launches24h} in 24h) · {live.dev.graduated} graduated · best ATH $
                       {Math.round(live.dev.bestAthUsd / 1000)}k · {live.dev.died} died
+                      {live.dev.resolved !== undefined && (
+                        <span className="block text-zinc-500">
+                          {live.dev.successes} of {live.dev.resolved} resolved launches succeeded · success rate ≥ {((live.dev.successLowerBound ?? 0) * 100).toFixed(0)}% (95%)
+                        </span>
+                      )}
                     </p>
                   ) : (
                     <p className="text-zinc-500">Not looked up yet.</p>
@@ -468,6 +506,9 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
               <FlowBox label="Last 60s" f={f.flow60s} />
               <FlowBox label="Last 5m" f={f.flow5m} />
             </div>
+            {f.tapeFromLaunch && f.cohortsReliable === false && (
+              <p className="mt-3 text-xs text-amber-300/80">Tape has {f.tapeGaps} gap(s) since launch; cohort holdings below may be understated.</p>
+            )}
             {f.tapeFromLaunch && (
               <div className="num mt-3 flex flex-wrap gap-x-4 text-xs text-zinc-400">
                 <span>dev {f.cohorts.dev.heldPct.toFixed(1)}%</span>

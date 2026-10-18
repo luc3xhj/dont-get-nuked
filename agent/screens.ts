@@ -11,7 +11,8 @@ export function runScreens(s: CoinState): ScreenResult[] {
   const so = s.social;
   const t = CONFIG.screens;
   const out: ScreenResult[] = [];
-  const add = (id: string, label: string, level: ScreenResult["level"], detail: string) => out.push({ id, label, level, detail });
+  const add = (id: string, label: string, level: ScreenResult["level"], detail: string, observedAt: number | null = null) =>
+    out.push({ id, label, level, detail, observedAt, status: level === "ok" ? "verified" : level === "unknown" ? "unknown" : "adverse" });
 
   // Holders (RugCheck)
   if (!h) add("holders", "Top holders", "unknown", "No holder report yet");
@@ -22,6 +23,7 @@ export function runScreens(s: CoinState): ScreenResult[] {
       "Top-10 concentration",
       top >= t.top10ExPoolVetoPct ? "veto" : top >= t.top10ExPoolWarnPct ? "warn" : "ok",
       `${pct(top)} of supply (excl. curve/pool)`,
+      h.at,
     );
     add(
       "insiders",
@@ -31,14 +33,15 @@ export function runScreens(s: CoinState): ScreenResult[] {
       h.insidersDetected > 0
         ? `${h.insidersDetected} linked wallets still hold ${(h.insiderPct ?? 0).toFixed(1)}% of supply`
         : "None detected by RugCheck",
+      h.at,
     );
-    if (h.mintAuthority || h.freezeAuthority) add("authority", "Mint/freeze authority", "veto", "Authority not revoked");
-    if (h.rugged) add("rugged", "Rugged", "veto", "RugCheck marks this token as rugged");
+    if (h.mintAuthority || h.freezeAuthority) add("authority", "Mint/freeze authority", "veto", "Authority not revoked", h.at);
+    if (h.rugged) add("rugged", "Rugged", "veto", "RugCheck marks this token as rugged", h.at);
     // pump.fun coins launch immutable; mutable metadata means it can be rebranded after you buy.
-    if (h.metadataMutable) add("metadata", "Mutable metadata", "veto", "Name, image and links can still be changed");
+    if (h.metadataMutable) add("metadata", "Mutable metadata", "veto", "Name, image and links can still be changed", h.at);
     // `!= null`: reports saved before this field existed don't have it.
     if (h.lpLockedPct != null)
-      add("lp", "LP locked/burned", h.lpLockedPct < 90 ? "veto" : "ok", `${h.lpLockedPct.toFixed(0)}% of the graduation pool's LP is locked or burned`);
+      add("lp", "LP locked/burned", h.lpLockedPct < 90 ? "veto" : "ok", `${h.lpLockedPct.toFixed(0)}% of the graduation pool's LP is locked or burned`, h.at);
   }
 
   if (!f) {
@@ -46,8 +49,11 @@ export function runScreens(s: CoinState): ScreenResult[] {
     return out;
   }
 
-  // Cohorts from the tape
+  // Cohorts from the tape. Without the whole launch history (or with gaps since), holdings would look
+  // smaller than they are, so they're reported unknown rather than low.
   if (!f.tapeFromLaunch) add("cohorts", "Launch cohorts", "unknown", "Tape doesn't reach launch; snipers/bundles unknown");
+  else if (!f.cohortsReliable)
+    add("cohorts", "Launch cohorts", "unknown", `${f.tapeGaps} gap${f.tapeGaps > 1 ? "s" : ""} in the tape since launch; holdings may be understated`);
   else {
     const b = f.cohorts.bundles;
     add(
@@ -95,7 +101,8 @@ export function runScreens(s: CoinState): ScreenResult[] {
       "fresh",
       "Fresh wallets",
       fu.fresh >= 3 || fu.freshPct >= t.freshWalletPct ? "warn" : "ok",
-      `${fu.fresh} of ${fu.checked} top holders are under a day old (${fu.freshPct.toFixed(1)}% of supply)`
+      `${fu.fresh} of ${fu.checked} top holders are under a day old (${fu.freshPct.toFixed(1)}% of supply)`,
+      fu.at,
     );
     const top = fu.clusters[0];
     add(
@@ -104,7 +111,10 @@ export function runScreens(s: CoinState): ScreenResult[] {
       fu.topClusterPct >= t.fundingClusterVetoPct ? "veto" : fu.topClusterPct >= t.fundingClusterWarnPct ? "warn" : "ok",
       top
         ? `${top.wallets.length} top holders funded by ${top.funder.slice(0, 4)}…${top.funder.slice(-4)} hold ${top.pct.toFixed(1)}%`
-        : `No shared funders among ${fu.checked} top holders${fu.exchangeFunded ? ` (${fu.exchangeFunded} exchange-funded)` : ""}`
+        : `No shared funders among ${fu.checked} top holders${fu.exchangeFunded ? ` (${fu.exchangeFunded} exchange-funded)` : ""}${
+            fu.unresolvedPct != null && fu.unresolvedPct > 0 ? ` · ${fu.unresolvedPct.toFixed(1)}% of supply with no traceable SOL transfer` : ""
+          }`,
+      fu.at,
     );
   } else if (s.holders) add("funding", "Funding cluster", "unknown", "Wallet checks pending");
 
@@ -112,7 +122,7 @@ export function runScreens(s: CoinState): ScreenResult[] {
   const dv = s.dev;
   if (!dv) add("devhistory", "Developer history", "unknown", "Not looked up yet");
   else if (dv.launches24h >= t.serialLaunches24h)
-    add("devhistory", "Developer history", "warn", `Serial launcher: ${dv.launches24h} launches in 24h (${dv.successes} of ${dv.launches}${dv.capped ? "+" : ""} ever succeeded)`);
+    add("devhistory", "Developer history", "warn", `Serial launcher: ${dv.launches24h} launches in 24h (${dv.successes} of ${dv.launches}${dv.capped ? "+" : ""} ever succeeded)`, dv.at);
   else if (dv.launches >= 5 && dv.successes === 0)
     add("devhistory", "Developer history", "warn", `All ${dv.launches}${dv.capped ? "+" : ""} prior launches failed (best ATH $${Math.round(dv.bestAthUsd / 1000)}k)`);
   else
@@ -168,12 +178,44 @@ export function runScreens(s: CoinState): ScreenResult[] {
       "socials",
       "Socials",
       "ok",
-      `Tweet by @${so.author} (${so.authorFollowers?.toLocaleString()} followers): ${so.likes} likes, ${so.views ?? "?"} views`,
+      `Tweet by @${so.author} (${so.authorFollowers?.toLocaleString()} followers): ${so.likes} likes, ${so.views ?? "?"} views · ${so.mentionsMint ? "names this contract" : "doesn't name this contract"}`,
+      so.at,
     );
   else if (so?.kind === "profile" && so.error == null)
-    add("socials", "Socials", "ok", `Profile @${so.author}, ${so.authorFollowers?.toLocaleString()} followers`);
-  else add("socials", "Socials", "ok", `${links} link${links > 1 ? "s" : ""}${so?.kind === "community" ? " (X community)" : ""}`);
+    add("socials", "Socials", "ok", `Profile @${so.author}, ${so.authorFollowers?.toLocaleString()} followers · ${so.mentionsMint ? "bio names this contract" : "bio doesn't name this contract"}`, so.at);
+  // A link we couldn't read proves nothing either way.
+  else
+    add(
+      "socials",
+      "Socials",
+      "unknown",
+      `${links} link${links > 1 ? "s" : ""} present, content not readable${so?.kind === "community" ? " (X communities can't be read for free)" : so?.error ? ` (${so.error})` : ""}`,
+      so?.at ?? null,
+    );
 
+  // Old reports don't count as evidence: a stale "ok" becomes unknown, a stale problem stays visible.
+  const now = Date.now();
+  const d2 = CONFIG.decision;
+  const maxAge: Record<string, number> = {
+    top10: d2.holderReportMaxAgeMs,
+    insiders: d2.holderReportMaxAgeMs,
+    authority: d2.holderReportMaxAgeMs,
+    rugged: d2.holderReportMaxAgeMs,
+    metadata: d2.holderReportMaxAgeMs,
+    lp: d2.holderReportMaxAgeMs,
+    fresh: d2.fundingMaxAgeMs,
+    funding: d2.fundingMaxAgeMs,
+    devhistory: d2.devMaxAgeMs,
+    socials: d2.socialMaxAgeMs,
+  };
+  for (const r of out) {
+    const limit = maxAge[r.id];
+    if (!limit || !r.observedAt || now - r.observedAt <= limit) continue;
+    const mins = Math.round((now - r.observedAt) / 60_000);
+    r.status = "stale";
+    r.detail = `${r.detail} · stale (${mins}m old)`;
+    if (r.level === "ok") r.level = "unknown";
+  }
   return out;
 }
 

@@ -34,11 +34,19 @@ export type Features = {
   repeatBuyShare: number;
   tapeTrades: number;
   tapeFromLaunch: boolean;
+  observedMin?: number;
+  /** "observed" when the tape doesn't reach launch: the ATH shown is the highest we saw, not the true ATH. */
+  highScope?: "launch" | "observed";
+  tapeGaps?: number;
+  cohortsReliable?: boolean;
+  migratedAgeMin?: number | null;
 };
 export type ScreenLevel = "veto" | "warn" | "ok" | "unknown";
-export type Screen = { id: string; label: string; level: ScreenLevel; detail: string };
+export type EvidenceStatus = "verified" | "adverse" | "unknown" | "stale";
+export type Screen = { id: string; label: string; level: ScreenLevel; detail: string; status?: EvidenceStatus; observedAt?: number | null };
 export type Check = { label: string; ok: boolean; value: string };
-export type SetupEval = { setup: string; status: "armed" | "fire"; structure: Check[]; trigger: Check[]; quality: number };
+export type SetupEpisode = { id: string; state: "armed" | "fired" | "cooldown"; armedAt: number; firedAt: number | null; cooldownUntil?: number };
+export type SetupEval = { setup: string; status: "armed" | "fire"; structure: Check[]; trigger: Check[]; quality: number; episode?: SetupEpisode };
 export type Analysis = {
   at: number;
   expiresAt: number;
@@ -83,8 +91,19 @@ export type WatchedCoin = {
   quote: Quote | null;
   curveProgress: number | null;
   social: Social;
-  dev?: { launches: number; capped: boolean; launches24h: number; graduated: number; successes: number; successRate: number; bestAthUsd: number; died: number } | null;
-  funding?: { checked: number; fresh: number; freshPct: number; clusters: { funder: string; wallets: string[]; pct: number }[]; topClusterPct: number; exchangeFunded: number } | null;
+  dev?: {
+    launches: number;
+    capped: boolean;
+    launches24h: number;
+    graduated: number;
+    resolved?: number;
+    successes: number;
+    successRate: number;
+    successLowerBound?: number;
+    bestAthUsd: number;
+    died: number;
+  } | null;
+  funding?: { checked: number; fresh: number; freshPct: number; clusters: { funder: string; wallets: string[]; pct: number }[]; topClusterPct: number; exchangeFunded: number; payerOnly?: number; unresolvedPct?: number } | null;
 };
 
 export type AgentState = {
@@ -212,13 +231,20 @@ export type Decision = {
   analyst: { verdict: string; conviction: number; note: string };
   regime?: { level: string; reasons: string[] };
   reasons: string[];
+  version?: string;
+  /** Net economics at the exact size taken (null on a pass). */
+  costs?: { sizeSol: number; entryImpact: number; tp1NetSol: number; stopNetSol: number; netRewardRisk: number; roundTripCostPct: number } | null;
+  essentials?: { id: string; label: string; ok: boolean; detail: string }[];
 };
 export type PortfolioReport = {
   accounts: Account[];
   open: OpenPosition[];
-  pending: { account: AccountId; mint: string; side: string; reason: string; ageMs: number }[];
+  pending: { account: AccountId; mint: string; side: string; reason: string; ageMs: number; waiting?: boolean }[];
   closed: ClosedTrade[];
   decisions: Decision[];
+  strategyVersion?: string;
+  evidenceVersions?: string[];
+  researchCoverage?: { version: string; decisions: number; withValidReport: number; share: number; medianAgeMin: number | null };
 };
 
 export type ActivityItem = {

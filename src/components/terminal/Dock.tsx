@@ -149,9 +149,25 @@ function Performance() {
 function Decisions({ onSelect }: { onSelect: (mint: string) => void }) {
   const { portfolio } = useTerminal();
   const rows = portfolio?.decisions ?? [];
-  if (!rows.length) return <div className="p-4 text-xs text-zinc-500">No setup has fired since the agent last restarted.</div>;
+  const cov = portfolio?.researchCoverage;
+  const header = portfolio?.strategyVersion && (
+    <div className="num border-b border-line px-3 py-1.5 text-[11px] text-zinc-500">
+      Strategy {portfolio.strategyVersion} · learns from {portfolio.evidenceVersions?.join(", ") ?? "–"}
+      {cov &&
+        ` · research coverage ${cov.decisions ? `${(cov.share * 100).toFixed(0)}% of ${cov.decisions} decisions` : "no decisions yet"}${cov.medianAgeMin != null ? `, median report age ${cov.medianAgeMin.toFixed(0)}m` : ""}`}
+    </div>
+  );
+  if (!rows.length)
+    return (
+      <>
+        {header}
+        <div className="p-4 text-xs text-zinc-500">No setup has fired since the agent last restarted.</div>
+      </>
+    );
   return (
-    <table className="w-full text-xs">
+    <>
+      {header}
+      <table className="w-full text-xs">
       <tbody>
         {rows.map((d, i) => (
           <tr key={`${d.mint}-${d.at}-${i}`} onClick={() => onSelect(d.mint)} className="cursor-pointer border-t border-line first:border-t-0 hover:bg-panel-2">
@@ -162,7 +178,9 @@ function Decisions({ onSelect }: { onSelect: (mint: string) => void }) {
             </td>
             <td className="px-2 py-1.5 font-semibold text-zinc-100">{d.symbol}</td>
             <td className="px-2 py-1.5 text-zinc-500">{SETUP_LABEL[d.setup] ?? d.setup}</td>
-            <td className="num px-2 py-1.5 text-zinc-400">{d.sizeSol.toFixed(3)}◎</td>
+            <td className="num px-2 py-1.5 text-zinc-400" title={d.costs ? `Round trip ${(d.costs.roundTripCostPct * 100).toFixed(1)}% · net R/R ${d.costs.netRewardRisk.toFixed(2)}` : undefined}>
+              {d.sizeSol.toFixed(3)}◎{d.costs && <span className="text-zinc-600"> · R/R {d.costs.netRewardRisk.toFixed(1)}</span>}
+            </td>
             <td className="px-2 py-1.5 text-zinc-500">
               AI {d.analyst.verdict} ×{d.analyst.conviction.toFixed(2)}
               {d.regime && ` · ${d.regime.level}`}
@@ -175,6 +193,7 @@ function Decisions({ onSelect }: { onSelect: (mint: string) => void }) {
         ))}
       </tbody>
     </table>
+    </>
   );
 }
 

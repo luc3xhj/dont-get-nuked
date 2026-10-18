@@ -34,6 +34,8 @@ export type WalletInfo = {
   full: boolean;
   firstSeen: number | null;
   funder: string | null;
+  /** "transfer" = an actual SOL transfer into the wallet (real evidence); "fee_payer" = someone paid its first fee (weak). */
+  funderBasis?: "transfer" | "fee_payer" | null;
 };
 
 type Sig = { signature: string; blockTime: number | null };
@@ -43,28 +45,30 @@ type ParsedTx = {
   meta: { innerInstructions?: { instructions: ParsedIx[] }[] } | null;
 };
 
-/** Who sent this wallet its first SOL: a system transfer into it, else the fee payer of its first transaction. */
-function funderOf(tx: ParsedTx, wallet: string): string | null {
+/** Who sent this wallet its first SOL: a system transfer into it, else (weakly) the fee payer of its first transaction. */
+function funderOf(tx: ParsedTx, wallet: string): { funder: string; basis: "transfer" | "fee_payer" } | null {
   const ixs = [...tx.transaction.message.instructions, ...(tx.meta?.innerInstructions ?? []).flatMap((x) => x.instructions)];
   for (const ix of ixs) {
     const info = ix.parsed?.info;
     if (!info) continue;
-    if ((info.destination === wallet || info.newAccount === wallet) && typeof info.source === "string") return info.source;
+    if ((info.destination === wallet || info.newAccount === wallet) && typeof info.source === "string") return { funder: info.source, basis: "transfer" };
   }
   const payer = tx.transaction.message.accountKeys[0]?.pubkey;
-  return payer && payer !== wallet ? payer : null;
+  return payer && payer !== wallet ? { funder: payer, basis: "fee_payer" } : null;
 }
 
 async function walletInfo(address: string): Promise<WalletInfo> {
   const cached = db.prepare("SELECT data, at FROM wallets WHERE address = ?").get(address) as { data: string; at: number } | undefined;
   if (cached && Date.now() - cached.at < 6 * 3600_000) return JSON.parse(cached.data);
   const sigs = await rpc<Sig[]>(RPC_URL, "getSignaturesForAddress", [address, { limit: SIG_LIMIT }]);
-  const info: WalletInfo = { address, at: Date.now(), txCount: sigs.length, full: sigs.length < SIG_LIMIT, firstSeen: null, funder: null };
+  const info: WalletInfo = { address, at: Date.now(), txCount: sigs.length, full: sigs.length < SIG_LIMIT, firstSeen: null, funder: null, funderBasis: null };
   if (info.full && sigs.length) {
     const oldest = sigs[sigs.length - 1];
     info.firstSeen = oldest.blockTime ? oldest.blockTime * 1000 : null;
     const tx = await rpc<ParsedTx | null>(RPC_URL, "getTransaction", [oldest.signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }]);
-    if (tx) info.funder = funderOf(tx, address);
+    const f = tx ? funderOf(tx, address) : null;
+    info.funder = f?.funder ?? null;
+    info.funderBasis = f?.basis ?? null;
   }
   db.prepare("INSERT OR REPLACE INTO wallets (address, at, data) VALUES (?, ?, ?)").run(address, info.at, JSON.stringify(info));
   return info;
@@ -78,9 +82,11 @@ async function fundingReport(s: CoinState): Promise<FundingReport> {
   for (const h of holders) infos.push({ ...(await walletInfo(h.owner)), pct: h.pct });
   const fresh = infos.filter(isFresh);
   const byFunder = new Map<string, typeof infos>();
+  // Cached entries from before funderBasis existed are treated as weak (fee payer) evidence.
+  const byTransfer = (w: WalletInfo) => !!w.funder && w.funderBasis === "transfer";
   for (const w of infos) {
-    if (!w.funder || EXCHANGE_FUNDERS.has(w.funder)) continue;
-    byFunder.set(w.funder, [...(byFunder.get(w.funder) ?? []), w]);
+    if (!byTransfer(w) || EXCHANGE_FUNDERS.has(w.funder!)) continue;
+    byFunder.set(w.funder!, [...(byFunder.get(w.funder!) ?? []), w]);
   }
   const clusters = [...byFunder.entries()]
     .filter(([, ws]) => ws.length >= 2)
@@ -95,6 +101,9 @@ async function fundingReport(s: CoinState): Promise<FundingReport> {
     topClusterPct: clusters[0]?.pct ?? 0,
     exchangeFunded: infos.filter((w) => w.funder && EXCHANGE_FUNDERS.has(w.funder)).length,
     unknownFunder: infos.filter((w) => !w.funder).length,
+    payerOnly: infos.filter((w) => w.funder && !byTransfer(w)).length,
+    checkedPct: infos.reduce((a, w) => a + w.pct, 0),
+    unresolvedPct: infos.filter((w) => !byTransfer(w)).reduce((a, w) => a + w.pct, 0),
     provider: process.env.HELIUS_API_KEY ? "helius" : "public",
   };
 }

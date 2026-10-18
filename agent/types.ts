@@ -21,6 +21,9 @@ export type Coin = {
   lastTradeAt: number;
   firstSeen: number;
   updatedAt: number;
+  /** When it migrated to PumpSwap: pool creation time if known, else when we observed the change. */
+  migratedAt?: number | null;
+  migratedAtSource?: "pool_created" | "observed" | null;
 };
 
 export type Trade = {
@@ -49,6 +52,8 @@ export type Quote = {
   /** Pool reserves (PumpSwap); 0 on the curve, where reserves follow from the price. */
   reserveTokens: number;
   reserveSol: number;
+  /** When this pair was created (for a PumpSwap pool: the migration time). */
+  pairCreatedAt?: number | null;
 };
 
 export type Holder = { owner: string; pct: number; insider: boolean };
@@ -174,10 +179,25 @@ export type Features = {
   liquidityUsd: number | null;
   tapeTrades: number;
   tapeFromLaunch: boolean;
+  /** Minutes of trade history we actually hold; highs/lows are measured over this window. */
+  observedMin: number;
+  /** "launch" when the tape reaches the first trade, else "observed" (the true ATH may be higher). */
+  highScope: "launch" | "observed";
+  /** Poll gaps where trades may have been missed (page had no overlap with what we held). */
+  tapeGaps: number;
+  /** Launch cohorts are trustworthy only with a launch tape and no gaps since. */
+  cohortsReliable: boolean;
+  /** Minutes since migration, or null if unknown (never inferred from creation time). */
+  migratedAgeMin: number | null;
 };
 
 export type ScreenLevel = "veto" | "warn" | "ok" | "unknown";
-export type ScreenResult = { id: string; label: string; level: ScreenLevel; detail: string };
+/**
+ * verified = checked and fine · adverse = checked and bad · unknown = not observable or not yet checked ·
+ * stale = the report is too old to rely on (treated like unknown; it never passes as fine).
+ */
+export type EvidenceStatus = "verified" | "adverse" | "unknown" | "stale";
+export type ScreenResult = { id: string; label: string; level: ScreenLevel; detail: string; status?: EvidenceStatus; observedAt?: number | null };
 
 /** A creator's launch history on pump.fun (excluding the coin being judged). */
 export type DevReport = {
@@ -187,9 +207,13 @@ export type DevReport = {
   capped: boolean;
   launches24h: number;
   graduated: number;
-  /** Graduated, or reached a $100k ATH. */
+  /** Prior launches old enough for their outcome to be known (only these count toward quality). */
+  resolved: number;
+  /** Resolved launches that graduated or reached a $100k ATH. */
   successes: number;
   successRate: number;
+  /** Conservative (Wilson) lower bound on the success rate. */
+  successLowerBound: number;
   bestAthUsd: number;
   medianAthUsd: number;
   /** Older than an hour and never passed a $10k ATH. */
@@ -208,5 +232,10 @@ export type FundingReport = {
   topClusterPct: number;
   exchangeFunded: number;
   unknownFunder: number;
+  /** Funders identified only as a fee payer (weak evidence: not used to form clusters). */
+  payerOnly: number;
+  /** Share of supply in the holders we checked, and the part whose funding stayed unresolved. */
+  checkedPct: number;
+  unresolvedPct: number;
   provider: "helius" | "public";
 };

@@ -17,10 +17,13 @@ test("real paper pipeline preserves report → decision → order → fill → c
   const mint = "A".repeat(32);
   const a: Analysis = { id: "entry-report", at: now, expiresAt: now + 300_000, model: "test", verdict: "approve", conviction: 1, narrativeType: "unclear", narrative: "Test context", thesis: "Test evidence", contractVerified: "unknown", copycat: false, redFlags: [], greenFlags: [], wouldChangeMind: "More evidence", sources: [], durationMs: 1, research: { at: now, searches: [], sources: [] } };
   const s: CoinState = {
-    coin: { mint, name: "Example", symbol: "EX", creator: "creator", curve: "curve", pool: "pool", stage: "migrated", createdAt: now - 3600_000, socials: { twitter: null, website: null, telegram: null }, replies: 0, mcapUsd: 100000, athMcapUsd: 100000, curveProgress: 1, lastTradeAt: now, firstSeen: now, updatedAt: now },
+    coin: { mint, name: "Example", symbol: "EX", creator: "creator", curve: "curve", pool: "pool", stage: "migrated", createdAt: now - 3600_000, migratedAt: now - 1800_000, migratedAtSource: "pool_created", socials: { twitter: null, website: null, telegram: null }, replies: 0, mcapUsd: 100000, athMcapUsd: 100000, curveProgress: 1, lastTradeAt: now, firstSeen: now, updatedAt: now },
     quote: { at: now, priceSol: 0.000001, priceUsd: 0.00015, liquidityUsd: 30000, mcapUsd: 100000, reserveTokens: 100_000_000, reserveSol: 100 },
-    hot: true, hotSince: now, score: 1, trades: [], ids: new Set(), fromLaunch: false, backfilling: false, backfilled: true, nextPollAt: 0,
-    holders: null, social: null, dev: null, funding: null, features: null, screens: [], setups: [], analysis: a,
+    hot: true, hotSince: now, score: 1, trades: [], ids: new Set(), fromLaunch: false, backfilling: false, backfilled: true, nextPollAt: 0, tapeGaps: 0,
+    // The entry rules require fresh holder and funding evidence (unknown never passes as fine).
+    holders: { at: now, totalHolders: 500, top: [], top10ExPoolPct: 15, insidersDetected: 0, insiderPct: 0, creatorPct: 0, mintAuthority: null, freezeAuthority: null, metadataMutable: false, lpLockedPct: 100, rugged: false, risks: [] },
+    social: null, dev: null,
+    funding: { at: now, checked: 10, fresh: 0, freshPct: 0, clusters: [], topClusterPct: 0, exchangeFunded: 0, unknownFunder: 0, payerOnly: 0, checkedPct: 15, unresolvedPct: 0, provider: "public" }, features: null, screens: [], setups: [], analysis: a,
   };
   coins.set(mint, s);
   const ev: SetupEval = { setup: "migrated_base", status: "fire", structure: [], trigger: [], quality: 1, plan: { entrySol: 0.000001, stopSol: 0.0000008, tp1Sol: 0.000002, tp2Sol: 0.000003, maxHoldMin: 60 } };

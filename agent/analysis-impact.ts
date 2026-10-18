@@ -7,6 +7,8 @@ export const analysisKey = (mint: string, a: Pick<Analysis, "id" | "at">) => a.i
 export function compareAnalysis(input: {
   mint: string; analysis: Analysis | null; now: number; commonReasons: string[];
   sizeFor: (conviction: number) => number; defaultScale: number; minimum: number;
+  /** Size-dependent gates (e.g. net reward after costs at this exact size). */
+  checksFor?: (sizeSol: number) => string[];
 }): { actual: DecisionOutcome; impact: AnalysisImpact } {
   const { analysis, now, sizeFor, minimum } = input;
   const fresh = analysis && analysis.expiresAt > now ? analysis : null;
@@ -15,6 +17,7 @@ export function compareAnalysis(input: {
     const reasons = [...input.commonReasons];
     if (reject) reasons.push(`Analyst rejected: ${fresh?.redFlags[0] ?? fresh?.thesis ?? "Negative research verdict"}`);
     if (sizeSol < minimum) reasons.push(`Size ${sizeSol.toFixed(3)}◎ below minimum (thin pool or little cash)`);
+    else if (input.checksFor) reasons.push(...input.checksFor(sizeSol));
     return { take: reasons.length === 0, sizeSol, reasons };
   };
   const withoutAnalysis = outcome(input.defaultScale, false);

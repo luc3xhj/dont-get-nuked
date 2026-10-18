@@ -1,9 +1,10 @@
 // What actually predicts winners? Joins every benchmark (shadow) trade to the screens and features the
 // agent saw when its setup fired, then compares outcomes. Recommendations only appear with enough trades;
 // nothing is auto-applied — small samples in this market are mostly noise.
+import { CONFIG } from "./config";
 import { db } from "./db";
 
-type Closed = { mint: string; setup: string; openedAt: number; pnlSol: number; r: number; account: string };
+type Closed = { mint: string; setup: string; openedAt: number; pnlSol: number; r: number; account: string; version?: string };
 type Signal = { ts: number; mint: string; setup: string; screens: { id: string; level: string }[]; features: Record<string, unknown> | null };
 type Row = { r: number; win: boolean; setup: string; screens: Map<string, string>; f: Record<string, unknown> | null };
 type Stat = { n: number; winRate: number; avgR: number };
@@ -43,8 +44,12 @@ const FEATURES: { key: string; label: string; value: (f: Record<string, unknown>
   { key: "age", label: "Coin age (min)", value: (f) => get(f, "ageMin") },
 ];
 
-function rows(): { shadow: Row[]; baselineR: number[] } {
-  const closed = (db.prepare("SELECT data FROM closed WHERE account IN ('shadow', 'baseline')").all() as { data: string }[]).map((r) => JSON.parse(r.data) as Closed);
+const versionOf = (c: Closed) => c.version ?? "legacy";
+
+function rows(versions: string[] | null): { shadow: Row[]; baselineR: number[] } {
+  const closed = (db.prepare("SELECT data FROM closed WHERE account IN ('shadow', 'baseline')").all() as { data: string }[])
+    .map((r) => JSON.parse(r.data) as Closed)
+    .filter((c) => !versions || versions.includes(versionOf(c)));
   const signals = new Map<string, Signal[]>();
   for (const r of db.prepare("SELECT ts, mint, data FROM journal WHERE kind = 'signal'").all() as { ts: number; mint: string; data: string }[]) {
     const d = JSON.parse(r.data);
@@ -70,8 +75,17 @@ function bootstrapDiff(a: number[], b: number[], iters = 2000): [number, number]
   return [diffs[Math.floor(iters * 0.05)], diffs[Math.floor(iters * 0.95)]];
 }
 
-export function evidenceReport() {
-  const { shadow, baselineR } = rows();
+/** Benchmark trades per strategy version ("legacy" = before versioning), so versions are never pooled silently. */
+function byVersion() {
+  const closed = (db.prepare("SELECT data FROM closed WHERE account = 'shadow'").all() as { data: string }[]).map((r) => JSON.parse(r.data) as Closed);
+  const out: Record<string, Stat> = {};
+  for (const v of new Set(closed.map(versionOf))) out[v] = stat(closed.filter((c) => versionOf(c) === v).map((c) => ({ r: c.r, win: c.pnlSol > 0 })));
+  return out;
+}
+
+/** Evidence from the listed strategy versions only (default: the ones the agent learns from); null = all. */
+export function evidenceReport(versions: string[] | null = CONFIG.evidenceVersions) {
+  const { shadow, baselineR } = rows(versions);
   const recommendations: string[] = [];
 
   // Setups vs random coins: is there any selection edge at all?
@@ -128,6 +142,8 @@ export function evidenceReport() {
   });
 
   return {
+    versions: versions ?? "all",
+    byVersion: byVersion(),
     trades: shadow.length,
     joined: shadow.filter((x) => x.f).length,
     minN: MIN_N,

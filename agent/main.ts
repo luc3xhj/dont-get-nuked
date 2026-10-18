@@ -17,6 +17,7 @@ import { evidenceReport } from "./evidence";
 import { tregHealth } from "./research";
 import { researchReport } from "./research-report";
 import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio, walletSummary } from "./portfolio";
+import { restoreEpisodes, trackEpisodes } from "./episodes";
 import { evaluateSetups } from "./setups";
 import {
   coins,
@@ -48,7 +49,8 @@ function evaluate(s: CoinState) {
     }
   }
   captureHot(s);
-  const fired = s.setups.filter((x) => x.status === "fire");
+  // Only fires from a live episode count; an expired or invalidated one cools down first.
+  const fired = trackEpisodes(s.coin.mint, s.setups);
   if (fired.length) onSignals(s, fired);
 }
 
@@ -194,6 +196,7 @@ const server = createServer((req, res) => {
 
 restore();
 restorePortfolio();
+restoreEpisodes();
 for (const m of heldMints()) pinned.add(m);
 server.listen(CONFIG.port, "127.0.0.1", () => console.log(`agent API on http://127.0.0.1:${CONFIG.port}`));
 journal("start", null, { config: CONFIG });

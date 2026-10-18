@@ -3,9 +3,10 @@
 import { CONFIG } from "./config";
 import { db, journal, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
 import { budget } from "./http";
+import { wilsonLower } from "./stats";
 import { devReport, dsQuotes, GT_URL, gtTrades, holderReport, pumpList, socialReport, tradePage } from "./sources";
 import type { Analysis } from "./analyst";
-import type { SetupEval } from "./setups";
+import type { DevHistory, SetupEval } from "./setups";
 import type { Coin, DevReport, Features, FundingReport, HolderReport, Quote, ScreenResult, SocialReport, Trade } from "./types";
 
 export type CoinState = {
@@ -20,6 +21,8 @@ export type CoinState = {
   backfilling: boolean;
   /** Backfill attempted (once per hot stint). */
   backfilled: boolean;
+  /** Polls whose page had no overlap with the tape we held (trades may be missing). */
+  tapeGaps: number;
   nextPollAt: number;
   holders: HolderReport | null;
   social: SocialReport | null;
@@ -55,6 +58,7 @@ function stateFor(coin: Coin): CoinState {
       fromLaunch: false,
       backfilling: false,
       backfilled: false,
+      tapeGaps: 0,
       nextPollAt: 0,
       holders: loadReport<HolderReport>(coin.mint, "holders"),
       social: loadReport<SocialReport>(coin.mint, "social"),
@@ -70,7 +74,14 @@ function stateFor(coin: Coin): CoinState {
   } else {
     // Skip the first minutes after a restart: those transitions happened while we were down.
     if (s.coin.stage === "curve" && coin.stage === "migrated" && Date.now() - stats.startedAt > 120_000) graduations.push(Date.now());
-    s.coin = { ...coin, firstSeen: s.coin.firstSeen };
+    const migratedNow = s.coin.stage === "curve" && coin.stage === "migrated";
+    s.coin = {
+      ...coin,
+      firstSeen: s.coin.firstSeen,
+      // Keep what we learned about migration; list data doesn't carry it.
+      migratedAt: s.coin.migratedAt ?? (migratedNow ? Date.now() : null),
+      migratedAtSource: s.coin.migratedAtSource ?? (migratedNow ? "observed" : null),
+    };
   }
   return s;
 }
@@ -183,6 +194,7 @@ function selectHot(now: number) {
       s.ids.clear();
       s.fromLaunch = false;
       s.backfilled = false;
+      s.tapeGaps = 0;
     }
   }
 }
@@ -237,7 +249,10 @@ const wantsBackfill = (s: CoinState) => !s.backfilled && s.coin.stage === "curve
 /** Live tape poll: GeckoTerminal's last 300 trades (its own rate limit, deeper than pump.fun's 100). */
 async function pollTape(s: CoinState) {
   stats.tapePolls++;
-  const fresh = (await gtTrades(s.coin.mint, pairAddress(s.coin))).filter((t) => addTrade(s, t));
+  const page = await gtTrades(s.coin.mint, pairAddress(s.coin));
+  // A full page that shares nothing with what we hold means trades in between were missed.
+  if (s.trades.length && page.length >= 250 && !page.some((t) => s.ids.has(t.tx))) s.tapeGaps++;
+  const fresh = page.filter((t) => addTrade(s, t));
   saveTrades(fresh);
   stats.tradesIngested += fresh.length;
   const last = s.trades.at(-1);
@@ -338,17 +353,42 @@ export async function quoteTick() {
   const quotes = await dsQuotes(hot.map((s) => pairAddress(s.coin)));
   for (const s of hot) {
     const q = quotes[pairAddress(s.coin)];
-    if (q) s.quote = q;
+    if (!q) continue;
+    s.quote = q;
+    // A PumpSwap pool is created at migration: its creation time is the migration time.
+    if (s.coin.stage === "migrated" && q.pairCreatedAt && s.coin.migratedAtSource !== "pool_created") {
+      s.coin.migratedAt = q.pairCreatedAt;
+      s.coin.migratedAtSource = "pool_created";
+    }
   }
 }
 
 // ---------- creator history ----------
 
-/** Prior launches by this coin's creator: pump.fun's record when we have it, else coins we've observed. */
-export function devHistory(s: CoinState) {
-  if (s.dev) return { coins: s.dev.launches, successes: s.dev.successes, successRate: s.dev.successRate, source: "pump.fun" as const };
+/**
+ * Prior launches by this coin's creator: pump.fun's record when we have it, else coins we've observed.
+ * Only launches before this one, and only resolved ones (old enough to know the outcome), count.
+ */
+export function devHistory(s: CoinState): DevHistory {
+  const proven = (successes: number, resolved: number, lowerBound: number) =>
+    resolved >= CONFIG.developer.minResolved && lowerBound >= CONFIG.developer.minSuccessLowerBound;
+  if (s.dev && s.dev.resolved !== undefined) {
+    const d = s.dev;
+    return { coins: d.launches, resolved: d.resolved, successes: d.successes, successRate: d.successRate, lowerBound: d.successLowerBound, proven: proven(d.successes, d.resolved, d.successLowerBound), source: "pump.fun" };
+  }
   const rows = db.prepare("SELECT data FROM coins WHERE json_extract(data, '$.creator') = ?").all(s.coin.creator) as { data: string }[];
-  const prior = rows.map((r) => JSON.parse(r.data) as Coin).filter((c) => c.mint !== s.coin.mint);
-  const successes = prior.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length;
-  return { coins: prior.length, successes, successRate: prior.length ? successes / prior.length : 0, source: "observed" as const };
+  const now = Date.now();
+  const prior = rows.map((r) => JSON.parse(r.data) as Coin).filter((c) => c.mint !== s.coin.mint && c.createdAt < s.coin.createdAt);
+  const resolved = prior.filter((c) => now - c.createdAt >= CONFIG.developer.resolveAfterMs);
+  const successes = resolved.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length;
+  const lowerBound = wilsonLower(successes, resolved.length);
+  return {
+    coins: prior.length,
+    resolved: resolved.length,
+    successes,
+    successRate: resolved.length ? successes / resolved.length : 0,
+    lowerBound,
+    proven: proven(successes, resolved.length, lowerBound),
+    source: "observed",
+  };
 }

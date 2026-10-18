@@ -2,6 +2,32 @@
 // Setuh study notes (docs/trading-agent-design.md); calibrate them from the journal.
 
 export const CONFIG = {
+  /**
+   * Bump when strategy, screen, cost or execution semantics change. Trades and decisions are tagged
+   * with it, and the agent only learns from benchmark trades of the versions listed below.
+   */
+  strategyVersion: "2026-10-18.2",
+  /** Benchmark (shadow) trades from these versions inform sizing/edge decisions. Explicit, never implicit. */
+  evidenceVersions: ["2026-10-18.2"] as string[],
+
+  /** Decision-time evidence and cost requirements (roadmap Stage A). */
+  decision: {
+    /** Net reward at TP1 divided by net loss at the stop (both after fees, impact and stop gap). */
+    minNetRewardRisk: 1.0,
+    /** Older than this, a report is "stale" and can't satisfy an essential requirement. */
+    holderReportMaxAgeMs: 15 * 60_000,
+    socialMaxAgeMs: 60 * 60_000,
+    fundingMaxAgeMs: 2 * 3600_000,
+    devMaxAgeMs: 6 * 3600_000,
+    sizingIterations: 4,
+  },
+
+  /** Setup episodes: an armed setup that doesn't fire in time, or breaks its structure, is retired. */
+  setupEpisode: { maxArmedMs: 20 * 60_000, cooldownMs: 30 * 60_000 },
+
+  /** Developer quality: only prior launches old enough to have an outcome count. */
+  developer: { resolveAfterMs: 6 * 3600_000, minResolved: 3, minSuccessLowerBound: 0.15 },
+
   port: Number(process.env.AGENT_PORT ?? 3101),
   dbPath: process.env.AGENT_DB ?? "agent/data/agent.sqlite",
 
@@ -70,4 +96,4 @@ export const CONFIG = {
   },
 
   totalSupply: 1_000_000_000,
-} as const;
+};
