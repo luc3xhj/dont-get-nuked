@@ -60,9 +60,16 @@ export type HolderReport = {
   top: Holder[];
   top10ExPoolPct: number;
   insidersDetected: number;
+  /** % of supply still held by RugCheck's linked insider networks. */
+  insiderPct?: number;
   creatorPct: number | null;
   mintAuthority: string | null;
   freezeAuthority: string | null;
+  /** Metadata can be changed after launch (name, image, links). */
+  metadataMutable: boolean | null;
+  /** LP locked/burned % in the deepest pool (migrated coins); null on the curve. */
+  lpLockedPct: number | null;
+  rugged: boolean;
   risks: string[];
 };
 
@@ -95,6 +102,21 @@ export type Flow = {
   maxBuySol: number;
   /** Share of volume from wallets that both bought and sold in the window. */
   roundTripShare: number;
+};
+
+export type VolumeQuality = {
+  trades: number;
+  traders: number;
+  tradesPerTrader: number;
+  avgTradeSol: number;
+  /** Wallets that both bought and sold. */
+  twoSidedShare: number;
+  /** Mean min(buy, sell) / max(buy, sell) across the 10 biggest wallets; ~1 means pure round trips. */
+  roundTripTop10: number;
+  top5VolShare: number;
+  top10VolShare: number;
+  /** 0–1 composite; null when there are too few trades to judge. */
+  washScore: number | null;
 };
 
 export type Cohort = {
@@ -132,6 +154,12 @@ export type Features = {
   topSellerActive: boolean;
   /** Share of 5m buys that repeat the same wallet + size (bump/volume bots). */
   repeatBuyShare: number;
+  /** Volume quality over 5 minutes (wash / bot detection, Bitquery-style). */
+  volume: VolumeQuality;
+  /** Bonding-curve progress per minute of age; fast fills often mean coordinated buying. */
+  curveFillPerMin: number | null;
+  /** Share of all buy SOL since launch that came from the 10 biggest buyers (needs launch tape). */
+  launchBuyConcentration: number | null;
   higherLow: boolean;
   curveProgress: number | null;
   flow15s: Flow;

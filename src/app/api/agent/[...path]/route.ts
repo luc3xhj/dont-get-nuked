@@ -10,7 +10,11 @@ async function proxy(req: Request, { params }: { params: Promise<{ path: string[
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     });
-    return new Response(res.body, { status: res.status, headers: { "content-type": "application/json" } });
+    // Pass through the worker's content type (JSON, or CSV for the dataset export).
+    const headers = new Headers({ "content-type": res.headers.get("content-type") ?? "application/json" });
+    const disposition = res.headers.get("content-disposition");
+    if (disposition) headers.set("content-disposition", disposition);
+    return new Response(res.body, { status: res.status, headers });
   } catch {
     return Response.json({ error: "Agent worker is not running. Start it with `npm run agent`." }, { status: 503 });
   }

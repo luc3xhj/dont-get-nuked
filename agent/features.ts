@@ -1,7 +1,7 @@
 // Deterministic features computed from a coin's trade tape. All prices in SOL.
 import { CONFIG } from "./config";
 import type { CoinState } from "./state";
-import type { Cohort, Features, Flow, Trade } from "./types";
+import type { Cohort, Features, Flow, Trade, VolumeQuality } from "./types";
 
 const median = (xs: number[]) => {
   if (!xs.length) return 0;
@@ -54,6 +54,57 @@ function flow(trades: Trade[], from: number, to: number, firstSeen: Map<string, 
     maxBuySol: buySizes.length ? Math.max(...buySizes) : 0,
     roundTripShare: totalVol ? roundTripVol / totalVol : 0,
   };
+}
+
+const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+/**
+ * Volume quality: fake volume shows up as many trades per wallet, small trades, wallets on both
+ * sides with buy ≈ sell (round trips), and volume concentrated in a few wallets.
+ * See docs/meme-trading-playbook.md §3 (Bitquery wash-trading cases).
+ */
+function volumeQuality(trades: Trade[], from: number, to: number, repeatBuyShare: number): VolumeQuality {
+  const byWallet = new Map<string, { buy: number; sell: number; n: number }>();
+  let vol = 0;
+  let n = 0;
+  for (const t of trades) {
+    if (t.ts < from || t.ts > to) continue;
+    const w = byWallet.get(t.wallet) ?? { buy: 0, sell: 0, n: 0 };
+    if (t.side === "buy") w.buy += t.sol;
+    else w.sell += t.sol;
+    w.n++;
+    byWallet.set(t.wallet, w);
+    vol += t.sol;
+    n++;
+  }
+  const wallets = [...byWallet.values()];
+  const ranked = [...wallets].sort((a, b) => b.buy + b.sell - (a.buy + a.sell));
+  const share = (k: number) => (vol ? ranked.slice(0, k).reduce((s, w) => s + w.buy + w.sell, 0) / vol : 0);
+  const top10 = ranked.slice(0, 10);
+  const roundTripTop10 = top10.length
+    ? top10.reduce((s, w) => s + (Math.max(w.buy, w.sell) ? Math.min(w.buy, w.sell) / Math.max(w.buy, w.sell) : 0), 0) / top10.length
+    : 0;
+  const twoSidedShare = wallets.length ? wallets.filter((w) => w.buy > 0 && w.sell > 0).length / wallets.length : 0;
+  const tradesPerTrader = wallets.length ? n / wallets.length : 0;
+  const q: VolumeQuality = {
+    trades: n,
+    traders: wallets.length,
+    tradesPerTrader,
+    avgTradeSol: n ? vol / n : 0,
+    twoSidedShare,
+    roundTripTop10,
+    top5VolShare: share(5),
+    top10VolShare: share(10),
+    washScore: null,
+  };
+  if (n >= 20)
+    q.washScore =
+      0.25 * clamp01((twoSidedShare - 0.2) / 0.6) +
+      0.25 * clamp01((roundTripTop10 - 0.5) / 0.5) +
+      0.2 * clamp01((q.top10VolShare - 0.3) / 0.5) +
+      0.15 * clamp01((tradesPerTrader - 3) / 12) +
+      0.15 * clamp01((repeatBuyShare - 0.2) / 0.6);
+  return q;
 }
 
 function cohort(trades: Trade[], wallets: Set<string>, now: number): Cohort {
@@ -188,10 +239,26 @@ export function computeFeatures(s: CoinState, now = Date.now()): Features | null
   }
   let repeats = 0;
   for (const t of buys5m) if ((sizeCount.get(`${t.wallet}:${t.sol.toFixed(3)}`) ?? 0) >= 2) repeats++;
+  const repeatBuyShare = buys5m.length ? repeats / buys5m.length : 0;
+
+  // ---- launch concentration: who paid for the curve ----
+  let launchBuyConcentration: number | null = null;
+  if (launchSlot !== null) {
+    const spent = new Map<string, number>();
+    let total = 0;
+    for (const t of trades)
+      if (t.side === "buy") {
+        spent.set(t.wallet, (spent.get(t.wallet) ?? 0) + t.sol);
+        total += t.sol;
+      }
+    const top = [...spent.values()].sort((a, b) => b - a).slice(0, 10);
+    launchBuyConcentration = total ? top.reduce((a, b) => a + b, 0) / total : null;
+  }
+  const ageMin = (now - (s.coin.createdAt || trades[0].ts)) / 60_000;
 
   return {
     at: now,
-    ageMin: (now - (s.coin.createdAt || trades[0].ts)) / 60_000,
+    ageMin,
     stage: s.coin.stage,
     priceSol,
     mcapSol: priceSol * CONFIG.totalSupply,
@@ -208,7 +275,10 @@ export function computeFeatures(s: CoinState, now = Date.now()): Features | null
     lo10Sol: lo10,
     topSellerPct: (topSold / CONFIG.totalSupply) * 100,
     topSellerActive,
-    repeatBuyShare: buys5m.length ? repeats / buys5m.length : 0,
+    repeatBuyShare,
+    volume: volumeQuality(trades, now - 300_000, now, repeatBuyShare),
+    curveFillPerMin: s.coin.stage === "curve" && s.coin.curveProgress !== null && ageMin > 0 ? s.coin.curveProgress / ageMin : null,
+    launchBuyConcentration,
     higherLow,
     curveProgress: s.coin.curveProgress,
     flow15s: flow(trades, now - 15_000, now, firstSeen),

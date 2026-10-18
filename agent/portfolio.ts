@@ -7,6 +7,7 @@ import { db, journal } from "./db";
 import { fillBuy, fillSell, latency, liquidationValue, maxSizeForImpact, roundTripCost } from "./execution";
 import { SETUP_LABEL, type Plan, type SetupEval, type SetupId } from "./setups";
 import type { Analysis } from "./analyst";
+import { regime } from "./regime";
 import { verdict } from "./screens";
 import { coins, type CoinState } from "./state";
 
@@ -272,6 +273,7 @@ export type Decision = {
   mode: "explore" | "evidence";
   n: number;
   analyst: { verdict: Analysis["verdict"] | "none"; conviction: number; note: string };
+  regime: { level: string; reasons: string[] };
 };
 
 /** The agent's judgment on a fired setup. Every reason is journaled for calibration. */
@@ -308,7 +310,10 @@ export function decide(s: CoinState, ev: SetupEval): Decision {
     ? { verdict: an.verdict, conviction: an.conviction, note: an.verdict === "reject" ? (an.redFlags[0] ?? an.thesis) : an.narrative }
     : { verdict: "none" as const, conviction: RISK.noAnalysisScale, note: "No fresh analyst verdict" };
   if (an?.verdict === "reject") reasons.push(`Analyst rejected: ${analyst.note}`);
-  const riskScale = (mode === "explore" ? RISK.explorationRiskScale : 1) * analyst.conviction;
+  // Market regime: don't trade into a bad tape; half size when it's shaky.
+  if (regime.level === "bad") reasons.push(`Market regime bad: ${regime.reasons.join("; ")}`);
+  const regimeScale = regime.level === "caution" ? 0.5 : 1;
+  const riskScale = (mode === "explore" ? RISK.explorationRiskScale : 1) * analyst.conviction * regimeScale;
   let size = (equity * RISK.riskPerTrade * riskScale) / (risk * RISK.stopGap + roundTripCost(s, 0.5));
   size = Math.min(size, equity * RISK.maxPositionFraction, maxSizeForImpact(s, RISK.maxImpact), a.cash * 0.95);
   if (size < RISK.minOrderSol) reasons.push(`Size ${size.toFixed(3)}◎ below minimum (thin pool or little cash)`);
@@ -318,7 +323,17 @@ export function decide(s: CoinState, ev: SetupEval): Decision {
   if (mode === "evidence" && evd.shrunkR < RISK.minEdgeR)
     reasons.push(`No edge yet: shadow avg ${evd.avgR.toFixed(2)}R over ${evd.n} trades (${(evd.winRate * 100).toFixed(0)}% wins)`);
 
-  return { take: reasons.length === 0, sizeSol: size, reasons, ev: evFrac, p: evd.winRate, mode, n: evd.n, analyst };
+  return {
+    take: reasons.length === 0,
+    sizeSol: size,
+    reasons,
+    ev: evFrac,
+    p: evd.winRate,
+    mode,
+    n: evd.n,
+    analyst,
+    regime: { level: regime.level, reasons: regime.reasons },
+  };
 }
 
 /** Called each evaluation with a coin's fired setups. */
@@ -562,14 +577,15 @@ function manage(p: Position) {
 
   // Thesis exits from live evidence.
   if (f && f.cohorts.dev.sellSol60s >= 0.2 && heldMin > 0.5) return placeSell(p, 1, "Dev is selling");
-  const newVeto = s.screens.find(
-    (x) => x.level === "veto" && (x.id === "insiders" || x.id === "bundles" || x.id === "liquidity") && !(p.entryVetoes ?? []).includes(x.id),
-  );
+  const newVeto = s.screens.find((x) => x.level === "veto" && THESIS_VETOES.has(x.id) && !(p.entryVetoes ?? []).includes(x.id));
   if (newVeto) return placeSell(p, 1, `New veto: ${newVeto.label}`);
   const an = freshAnalysis(s);
   if (p.account === "agent" && an?.verdict === "reject" && an.at > p.openedAt) return placeSell(p, 1, "Analyst turned negative");
   if (p.liquidityAtEntry && s.quote.liquidityUsd && s.quote.liquidityUsd < p.liquidityAtEntry * 0.6) return placeSell(p, 1, "Liquidity pulled");
 }
+
+/** Screen vetoes that break a held position's thesis if they appear after entry. */
+const THESIS_VETOES = new Set(["insiders", "bundles", "liquidity", "lp", "rugged", "metadata"]);
 
 let lastEquityAt = 0;
 
@@ -617,7 +633,8 @@ export function portfolioReport() {
     for (const setup of new Set(rows.map((r) => r.setup))) bySetup[setup] = statsOf(rows.filter((r) => r.setup === setup));
     // Does the analyst's verdict at entry predict outcomes? (Most meaningful on the shadow book.)
     const byAnalyst: Record<string, ReturnType<typeof statsOf>> = {};
-    for (const v of new Set(rows.map((r) => r.analystAtEntry ?? "none"))) byAnalyst[v] = statsOf(rows.filter((r) => (r.analystAtEntry ?? "none") === v));
+    for (const v of new Set(rows.map((r) => r.analystAtEntry ?? "none")))
+      byAnalyst[v] = statsOf(rows.filter((r) => (r.analystAtEntry ?? "none") === v));
     return {
       id,
       ...equityOf(id),

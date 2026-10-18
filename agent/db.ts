@@ -56,7 +56,9 @@ db.exec(`
   );
 `);
 
-const upsertCoin = db.prepare("INSERT INTO coins (mint, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(mint) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at");
+const upsertCoin = db.prepare(
+  "INSERT INTO coins (mint, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(mint) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+);
 export function saveCoin(c: Coin) {
   upsertCoin.run(c.mint, JSON.stringify(c), c.updatedAt);
 }
@@ -66,7 +68,7 @@ export function loadCoins(sinceMs: number): Coin[] {
 }
 
 const insertTrade = db.prepare(
-  "INSERT OR IGNORE INTO trades (id, tx, mint, ts, slot, wallet, side, sol, tokens, price_sol, program) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  "INSERT OR IGNORE INTO trades (id, tx, mint, ts, slot, wallet, side, sol, tokens, price_sol, program) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 );
 export function saveTrades(trades: Trade[]) {
   if (!trades.length) return;
@@ -81,13 +83,13 @@ export function saveTrades(trades: Trade[]) {
 }
 
 export function loadTrades(mint: string): Trade[] {
-  return (
-    db.prepare("SELECT id, tx, mint, ts, slot, wallet, side, sol, tokens, price_sol AS priceSol, program FROM trades WHERE mint = ? ORDER BY id").all(mint) as Trade[]
-  );
+  return db
+    .prepare("SELECT id, tx, mint, ts, slot, wallet, side, sol, tokens, price_sol AS priceSol, program FROM trades WHERE mint = ? ORDER BY id")
+    .all(mint) as Trade[];
 }
 
 const upsertReport = db.prepare(
-  "INSERT INTO reports (mint, kind, at, data) VALUES (?, ?, ?, ?) ON CONFLICT(mint, kind) DO UPDATE SET at = excluded.at, data = excluded.data"
+  "INSERT INTO reports (mint, kind, at, data) VALUES (?, ?, ?, ?) ON CONFLICT(mint, kind) DO UPDATE SET at = excluded.at, data = excluded.data",
 );
 export function saveReport(mint: string, kind: string, at: number, data: unknown) {
   upsertReport.run(mint, kind, at, JSON.stringify(data));

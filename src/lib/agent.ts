@@ -92,8 +92,28 @@ export type AgentState = {
   http: Record<string, { ok: number; errors: number; pausedForMs: number; lastError: string | null }>;
   analyst: { status: string; lastError: string | null; callsLastHour: number; maxPerHour: number; model: string; running: string | null };
   treg: { configured: boolean; calls: number; failures: number; disabled: string | null; lastError: string | null };
+  regime: Regime;
   hot: WatchedCoin[];
 };
+
+export type Regime = {
+  level: "good" | "caution" | "bad";
+  reasons: string[];
+  solUsd: number | null;
+  solChange1h: number | null;
+  graduations2h: number | null;
+  launches1h: number;
+  benchmarkAvgR: number | null;
+  benchmarkTrades: number;
+};
+
+export const REGIME_TONE: Record<Regime["level"], string> = {
+  good: "border-emerald-900 bg-emerald-500/5 text-emerald-300",
+  caution: "border-amber-900 bg-amber-500/10 text-amber-300",
+  bad: "border-rose-900 bg-rose-500/10 text-rose-300",
+};
+
+export type DatasetSummary = { captured: number; labeled: number; rugs: number; graduated: number; sampled: number; rugRate: number | null };
 
 export type Fill = { ts: number; side: "buy" | "sell"; sol: number; priceSol: number; reason?: string };
 export type TapeTrade = { id: string; ts: number; wallet: string; side: "buy" | "sell"; sol: number; priceSol: number };
@@ -188,6 +208,7 @@ export type Decision = {
   mode: "explore" | "evidence";
   n: number;
   analyst: { verdict: string; conviction: number; note: string };
+  regime?: { level: string; reasons: string[] };
   reasons: string[];
 };
 export type PortfolioReport = {

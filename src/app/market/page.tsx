@@ -6,6 +6,7 @@ import {
   coinImage,
   LANE_LABEL,
   LANE_TONE,
+  REGIME_TONE,
   SCREEN_TONE,
   SETUP_LABEL,
   VERDICT_TONE,
@@ -68,6 +69,9 @@ export default function Market() {
           </p>
         </div>
         <div className="ml-auto flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-400">
+          <span className={`rounded border px-1.5 capitalize ${REGIME_TONE[data.regime.level]}`} title={data.regime.reasons.join("; ")}>
+            regime {data.regime.level}
+          </span>
           <span className="num">{data.stats.tracked} tracked</span>
           <span className="num">{data.stats.hot} deep-watched</span>
           <span className="num">{data.stats.tradesIngested.toLocaleString()} trades read</span>

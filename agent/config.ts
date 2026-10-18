@@ -55,7 +55,12 @@ export const CONFIG = {
     bundleHeldWarnPct: 7,
     sniperHeldWarnPct: 15,
     devHeldWarnPct: 8,
-    washShareWarn: 0.35,
+    /** Veto when holders RugCheck links as insiders control at least this much supply. */
+    insiderVetoPct: 10,
+    washWarn: 0.45,
+    /** A call from an account this large is a chase risk (big-account calls did worst). */
+    bigAccountFollowers: 200_000,
+    washVeto: 0.7,
   },
 
   totalSupply: 1_000_000_000,

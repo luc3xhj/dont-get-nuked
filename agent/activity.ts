@@ -80,8 +80,16 @@ function describe(kind: string, d: any): Pick<ActivityItem, "tone" | "title" | "
 
 export function activity(limit = 60, beforeSeq?: number, mint?: string): ActivityItem[] {
   const rows = db
-    .prepare(`SELECT seq, ts, mint, kind, data FROM journal WHERE kind IN (${KINDS.map(() => "?").join(",")}) AND seq < ?${mint ? " AND mint = ?" : ""} ORDER BY seq DESC LIMIT ?`)
-    .all(...KINDS, beforeSeq ?? Number.MAX_SAFE_INTEGER, ...(mint ? [mint] : []), limit * 4) as { seq: number; ts: number; mint: string | null; kind: string; data: string }[];
+    .prepare(
+      `SELECT seq, ts, mint, kind, data FROM journal WHERE kind IN (${KINDS.map(() => "?").join(",")}) AND seq < ?${mint ? " AND mint = ?" : ""} ORDER BY seq DESC LIMIT ?`,
+    )
+    .all(...KINDS, beforeSeq ?? Number.MAX_SAFE_INTEGER, ...(mint ? [mint] : []), limit * 4) as {
+    seq: number;
+    ts: number;
+    mint: string | null;
+    kind: string;
+    data: string;
+  }[];
   const out: ActivityItem[] = [];
   for (const r of rows) {
     const d = describe(r.kind, JSON.parse(r.data));

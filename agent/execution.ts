@@ -67,8 +67,7 @@ export function maxSizeForImpact(s: CoinState, maxImpact: number) {
 }
 
 export type Fill =
-  | { ok: true; sol: number; tokens: number; priceSol: number; feeSol: number; impact: number }
-  | { ok: false; reason: string; feeSol: number };
+  { ok: true; sol: number; tokens: number; priceSol: number; feeSol: number; impact: number } | { ok: false; reason: string; feeSol: number };
 
 const freshQuote = (s: CoinState, after: number) => !!s.quote && s.quote.at >= after && Date.now() - s.quote.at <= EXEC.quoteMaxAgeMs;
 

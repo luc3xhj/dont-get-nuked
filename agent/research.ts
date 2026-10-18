@@ -123,12 +123,24 @@ export async function buildEvidence(s: CoinState) {
       views: s.social.views,
       mentionsThisContract: s.social.mentionsMint,
       error: s.social.error,
+      // Is this a promotional call (mentions the contract) or the narrative source (doesn't)?
+      readAs:
+        s.social.kind !== "tweet"
+          ? s.social.kind
+          : s.social.mentionsMint
+            ? (s.social.authorFollowers ?? 0) >= 200_000
+              ? "promotional call by a very large account (historically the worst post-call returns)"
+              : "promotional call"
+            : "narrative source (post doesn't mention this contract)",
     },
     tickerReuse: tickerReuse(c),
     holders: s.holders && {
       totalHolders: s.holders.totalHolders,
       top10ExPoolPct: round(s.holders.top10ExPoolPct, 1),
       insiderWalletsFlagged: s.holders.insidersDetected,
+      insiderNetworksHoldPct: round(s.holders.insiderPct ?? 0, 1),
+      metadataMutable: s.holders.metadataMutable,
+      lpLockedPct: s.holders.lpLockedPct ?? null,
       risks: s.holders.risks,
     },
     market: f && {
@@ -145,6 +157,13 @@ export async function buildEvidence(s: CoinState) {
       insidersHeldPct: round(f.cohorts.insiders.heldPct, 1),
       devHeldPct: round(f.cohorts.dev.heldPct, 1),
       repeatBuyShare: round(f.repeatBuyShare),
+      volumeQuality: {
+        washScore: f.volume.washScore === null ? null : round(f.volume.washScore),
+        top10WalletVolumeShare: round(f.volume.top10VolShare),
+        twoSidedWalletShare: round(f.volume.twoSidedShare),
+        tradesPerWallet: round(f.volume.tradesPerTrader, 1),
+      },
+      launchBuyConcentrationTop10: f.launchBuyConcentration === null ? null : round(f.launchBuyConcentration),
       launchCohortsKnown: f.tapeFromLaunch,
     },
     screens: s.screens.filter((x) => x.level !== "ok").map((x) => `${x.level}: ${x.label} — ${x.detail}`),

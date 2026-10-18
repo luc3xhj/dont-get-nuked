@@ -32,6 +32,8 @@ export type CoinState = {
 };
 
 export const coins = new Map<string, CoinState>();
+/** When we saw a tracked coin graduate (curve → PumpSwap), for the regime filter. Observed transitions only. */
+export const graduations: number[] = [];
 /** Mints that must stay deep-watched (open positions), set by the portfolio. */
 export const pinned = new Set<string>();
 /** Held or armed coins get their tapes polled first. */
@@ -62,6 +64,8 @@ function stateFor(coin: Coin): CoinState {
     };
     coins.set(coin.mint, s);
   } else {
+    // Skip the first minutes after a restart: those transitions happened while we were down.
+    if (s.coin.stage === "curve" && coin.stage === "migrated" && Date.now() - stats.startedAt > 120_000) graduations.push(Date.now());
     s.coin = { ...coin, firstSeen: s.coin.firstSeen };
   }
   return s;
@@ -112,13 +116,14 @@ function attention(c: Coin, now: number): number {
 }
 
 export async function refreshUniverse() {
+  while (graduations.length && Date.now() - graduations[0] > 6 * 3600_000) graduations.shift();
   const lists = await Promise.all(
     [pumpList("created_timestamp"), pumpList("last_trade_timestamp"), pumpList("market_cap", "&complete=false")].map((p) =>
       p.catch(() => {
         stats.listErrors++;
         return [] as Coin[];
-      })
-    )
+      }),
+    ),
   );
   stats.listRefreshes++;
   const now = Date.now();
@@ -139,7 +144,7 @@ function selectHot(now: number) {
   const keep = all.filter(
     (s) =>
       pinned.has(s.coin.mint) ||
-      (s.hot && laneOf(s.coin, now) && now - (s.hotSince ?? 0) < CONFIG.universe.minHotMs && now - lastActivity(s) < CONFIG.universe.idleMs)
+      (s.hot && laneOf(s.coin, now) && now - (s.hotSince ?? 0) < CONFIG.universe.minHotMs && now - lastActivity(s) < CONFIG.universe.idleMs),
   );
   const hot = new Set(keep);
   const ranked = all.filter((s) => !hot.has(s) && s.score > -Infinity).sort((a, b) => liveScore(b) - liveScore(a));
@@ -272,7 +277,7 @@ export async function tapeTick(onUpdate: (s: CoinState) => void) {
         stats.tapeErrors++;
         s.nextPollAt = Date.now() + 10_000;
       }
-    })
+    }),
   );
 }
 
@@ -331,7 +336,11 @@ export function devHistory(creator: string, excludeMint: string) {
   if (hit && Date.now() - hit.at < 5 * 60_000) return hit;
   const rows = db.prepare("SELECT data FROM coins WHERE json_extract(data, '$.creator') = ?").all(creator) as { data: string }[];
   const prior = rows.map((r) => JSON.parse(r.data) as Coin).filter((c) => c.mint !== excludeMint);
-  const out = { at: Date.now(), coins: prior.length, successes: prior.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length };
+  const out = {
+    at: Date.now(),
+    coins: prior.length,
+    successes: prior.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length,
+  };
   devCache.set(creator, out);
   return out;
 }

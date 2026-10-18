@@ -10,10 +10,25 @@ import { computeFeatures } from "./features";
 import { httpStats } from "./http";
 import { runScreens, verdict } from "./screens";
 import { ANALYST, analystHealth, analystTick } from "./analyst";
+import { captureHot, datasetCsv, datasetSummary, labelTick, sampleTick } from "./dataset";
+import { regime, regimeTick } from "./regime";
 import { tregHealth } from "./research";
 import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio, walletSummary } from "./portfolio";
 import { evaluateSetups } from "./setups";
-import { coins, devHistory, laneOf, pairAddress, pinned, quoteTick, refreshUniverse, reportsTick, restore, stats, tapeTick, type CoinState } from "./state";
+import {
+  coins,
+  devHistory,
+  laneOf,
+  pairAddress,
+  pinned,
+  quoteTick,
+  refreshUniverse,
+  reportsTick,
+  restore,
+  stats,
+  tapeTick,
+  type CoinState,
+} from "./state";
 
 const lastArmed = new Map<string, number>();
 
@@ -29,6 +44,7 @@ function evaluate(s: CoinState) {
       journal("armed", s.coin.mint, { setup: x.setup, passed: x.trigger.filter((k) => k.ok).length, total: x.trigger.length });
     }
   }
+  captureHot(s);
   const fired = s.setups.filter((x) => x.status === "fire");
   if (fired.length) onSignals(s, fired);
 }
@@ -67,7 +83,12 @@ function summary(s: CoinState) {
     verdict: verdict(s.screens),
     screens: s.screens,
     features: f,
-    holders: s.holders && { at: s.holders.at, top10ExPoolPct: s.holders.top10ExPoolPct, totalHolders: s.holders.totalHolders, insidersDetected: s.holders.insidersDetected },
+    holders: s.holders && {
+      at: s.holders.at,
+      top10ExPoolPct: s.holders.top10ExPoolPct,
+      totalHolders: s.holders.totalHolders,
+      insidersDetected: s.holders.insidersDetected,
+    },
     social: s.social,
     setups: s.setups,
     analysis: s.analysis,
@@ -94,6 +115,15 @@ const server = createServer((req, res) => {
   }
   if (url.pathname === "/api/portfolio") return send(res, 200, portfolioReport());
   if (url.pathname === "/api/wallet") return send(res, 200, walletSummary());
+  if (url.pathname === "/api/dataset") return send(res, 200, datasetSummary());
+  if (url.pathname === "/api/dataset-csv") {
+    res.writeHead(200, {
+      "content-type": "text/csv",
+      "content-disposition": 'attachment; filename="early-life-dataset.csv"',
+      "cache-control": "no-store",
+    });
+    return res.end(datasetCsv());
+  }
   if (url.pathname === "/api/state") {
     const hot = [...coins.values()].filter((s) => s.hot).map(summary);
     return send(res, 200, {
@@ -101,15 +131,30 @@ const server = createServer((req, res) => {
       startedAt: stats.startedAt,
       stats: { ...stats, tracked: coins.size, hot: hot.length },
       http: httpStats(),
-      analyst: { ...analystHealth, callsLastHour: analystHealth.calls.length, maxPerHour: ANALYST.maxPerHour, model: ANALYST.model, calls: undefined },
+      analyst: {
+        ...analystHealth,
+        callsLastHour: analystHealth.calls.length,
+        maxPerHour: ANALYST.maxPerHour,
+        model: ANALYST.model,
+        calls: undefined,
+      },
       treg: tregHealth,
+      regime,
       hot,
     });
   }
   if (url.pathname === "/api/activity") {
     const before = Number(url.searchParams.get("before")) || undefined;
     const mint = url.searchParams.get("mint");
-    return send(res, 200, activity(Math.min(200, Number(url.searchParams.get("limit")) || 60), before, mint && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) ? mint : undefined));
+    return send(
+      res,
+      200,
+      activity(
+        Math.min(200, Number(url.searchParams.get("limit")) || 60),
+        before,
+        mint && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) ? mint : undefined,
+      ),
+    );
   }
   const m = url.pathname.match(/^\/api\/coin\/([1-9A-HJ-NP-Za-km-z]{32,44})$/);
   if (m) {
@@ -120,7 +165,16 @@ const server = createServer((req, res) => {
     // No longer watched: still show what we know and what the agent did.
     const c = storedCoin(mint);
     if (!c && !fills.length) return send(res, 404, { error: "Unknown coin" });
-    return send(res, 200, { mint, symbol: c?.symbol ?? null, name: c?.name ?? null, stage: c?.stage ?? null, pairAddress: c ? pairAddress(c) : null, socials: c?.socials ?? null, tracked: false, fills });
+    return send(res, 200, {
+      mint,
+      symbol: c?.symbol ?? null,
+      name: c?.name ?? null,
+      stage: c?.stage ?? null,
+      pairAddress: c ? pairAddress(c) : null,
+      socials: c?.socials ?? null,
+      tracked: false,
+      fills,
+    });
   }
   send(res, 404, { error: "not found" });
 });
@@ -138,6 +192,9 @@ loop("tape", 1_000, () => tapeTick(evaluate));
 loop("reports", 5_000, reportsTick);
 loop("quotes", 2_000, quoteTick);
 loop("analyst", 5_000, analystTick);
+loop("regime", 60_000, async () => regimeTick());
+loop("dataset-sample", 20_000, sampleTick);
+loop("dataset-label", 60_000, labelTick);
 // Re-evaluate every hot coin each second so time-based features (windows, exhaustion) stay current between trades.
 loop("evaluate", 1_000, async () => {
   for (const s of coins.values()) if (s.hot) evaluate(s);

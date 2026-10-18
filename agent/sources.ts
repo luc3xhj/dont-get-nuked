@@ -74,7 +74,7 @@ export type TradePage = { trades: Trade[]; nextCursor: string | null; hasMore: b
 export async function tradePage(mint: string, cursor: string | null): Promise<TradePage> {
   const json = await getJson<{ trades?: RawTrade[]; pagination?: { nextCursor?: string; hasMore?: boolean } }>(
     `${SWAP}/v2/coins/${mint}/trades?limit=${CONFIG.tape.pageSize}&cursor=${encodeURIComponent(cursor ?? "0")}&minSolAmount=0`,
-    { limit: CONFIG.tape.concurrency }
+    { limit: CONFIG.tape.concurrency },
   );
   const trades: Trade[] = [];
   for (const t of json.trades ?? []) {
@@ -105,12 +105,38 @@ type RugReport = {
   freezeAuthority?: string | null;
   risks?: { name: string }[];
   knownAccounts?: Record<string, { type?: string }>;
-  markets?: { pubkey?: string; liquidityA?: string; liquidityB?: string }[];
+  markets?: { pubkey?: string; marketType?: string; lp?: { lpLockedPct?: number; lpLockedUSD?: number; quoteUSD?: number; baseUSD?: number } }[];
+  tokenMeta?: { mutable?: boolean };
+  insiderNetworks?: { size?: number; type?: string; tokenAmount?: number; currentHolding?: number }[] | null;
+  totalMarketLiquidity?: number;
+  rugged?: boolean;
 };
 
-/** RugCheck's free report: top holders, insider graph, authorities. */
+/**
+ * LP lock of the PumpSwap pool created at graduation — the liquidity a developer could pull.
+ * Other pools (e.g. Meteora DLMM) are ordinary market makers who can always withdraw; not a rug lever.
+ */
+function graduationPoolLock(markets: NonNullable<RugReport["markets"]>): number | null {
+  const pool = markets.find((m) => m.marketType === "pump_fun_amm" && m.lp);
+  return pool ? num(pool.lp?.lpLockedPct) : null;
+}
+
+/**
+ * % of supply still held by RugCheck's linked insider networks. RugCheck reports amounts in whole
+ * tokens for some coins and raw units (6 decimals) for others; anything above the 1B supply must be raw.
+ */
+function insiderHeldPct(networks: NonNullable<RugReport["insiderNetworks"]>): number {
+  const raw = networks.some((n) => num(n.tokenAmount) > CONFIG.totalSupply || num(n.currentHolding) > CONFIG.totalSupply);
+  const held = networks.reduce((a, n) => a + num(n.currentHolding), 0) / (raw ? TOKEN_DECIMALS : 1);
+  return Math.min(100, (held / CONFIG.totalSupply) * 100);
+}
+
+/** RugCheck's free report: top holders, insider graph, authorities, metadata, LP. */
 export async function holderReport(coin: Coin): Promise<HolderReport> {
-  const r = await getJson<RugReport>(`https://api.rugcheck.xyz/v1/tokens/${coin.mint}/report`, { limit: CONFIG.holders.concurrency, timeoutMs: 20_000 });
+  const r = await getJson<RugReport>(`https://api.rugcheck.xyz/v1/tokens/${coin.mint}/report`, {
+    limit: CONFIG.holders.concurrency,
+    timeoutMs: 20_000,
+  });
   // The curve / pool / lockers hold supply that can't be dumped. The creator is a "known account"
   // too, but very much can dump, so only AMM and locker accounts are excluded.
   const programOwned = new Set<string>(
@@ -120,7 +146,7 @@ export async function holderReport(coin: Coin): Promise<HolderReport> {
       ...Object.entries(r.knownAccounts ?? {})
         .filter(([, v]) => v.type === "AMM" || v.type === "LOCKER")
         .map(([k]) => k),
-    ].filter(Boolean)
+    ].filter(Boolean),
   );
   const top = (r.topHolders ?? [])
     .filter((h) => h?.owner && !programOwned.has(h.owner))
@@ -132,9 +158,13 @@ export async function holderReport(coin: Coin): Promise<HolderReport> {
     top: top.slice(0, 20),
     top10ExPoolPct: top.slice(0, 10).reduce((s, h) => s + h.pct, 0),
     insidersDetected: num(r.graphInsidersDetected),
+    insiderPct: insiderHeldPct(r.insiderNetworks ?? []),
     creatorPct,
     mintAuthority: r.mintAuthority ?? null,
     freezeAuthority: r.freezeAuthority ?? null,
+    metadataMutable: r.tokenMeta?.mutable ?? null,
+    lpLockedPct: coin.stage === "migrated" ? graduationPoolLock(r.markets ?? []) : null,
+    rugged: !!r.rugged,
     risks: (r.risks ?? []).map((x) => x.name).slice(0, 10),
   };
 }
@@ -165,7 +195,7 @@ export async function socialReport(coin: Coin): Promise<SocialReport> {
     if (/^[A-Za-z0-9_]+\/status\/\d+/.test(path)) {
       const j = await getJson<{ tweet?: Record<string, unknown> & { author?: Record<string, unknown> } }>(
         `https://api.fxtwitter.com/${path.split("/").slice(0, 3).join("/")}`,
-        { limit: CONFIG.socials.concurrency }
+        { limit: CONFIG.socials.concurrency },
       );
       const t = j.tweet;
       if (!t) return { ...base, kind: "tweet", error: "not found" };
@@ -209,7 +239,7 @@ export async function dsQuotes(addresses: string[]): Promise<Record<string, Quot
   if (!addresses.length) return {};
   const json = await getJson<{ pairs?: Record<string, unknown>[] | null }>(
     `https://api.dexscreener.com/latest/dex/pairs/solana/${addresses.slice(0, 30).join(",")}`,
-    { limit: 2 }
+    { limit: 2 },
   );
   const out: Record<string, Quote> = {};
   for (const p of json.pairs ?? []) {

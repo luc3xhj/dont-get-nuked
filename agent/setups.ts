@@ -50,6 +50,20 @@ function plan(entry: number, stop: number, tp2: number, maxHoldMin: number, minT
   return { entrySol: entry, stopSol: stop, tp1Sol: tp1, tp2Sol: Math.max(tp2, tp1 * 1.15), maxHoldMin };
 }
 
+/**
+ * A curve that is ~90% full has little upside left to graduation but full downside, and graduation
+ * is often where insider-heavy coins get dumped (playbook §4). Only buy that late if insiders are light.
+ */
+function graduationCheck(s: CoinState, f: Features): Check {
+  const progress = s.coin.curveProgress ?? 0;
+  const heavy = f.cohorts.insiders.heldPct >= 5 || (s.holders?.top10ExPoolPct ?? 0) >= 25;
+  return c(
+    "Not buying into graduation with heavy insiders",
+    !(progress >= 0.9 && heavy),
+    `curve ${pct(progress)}, insiders ${f.cohorts.insiders.heldPct.toFixed(1)}%, top-10 ${(s.holders?.top10ExPoolPct ?? 0).toFixed(0)}%`,
+  );
+}
+
 const MAX_RISK = 0.3; // Setuh's "mental loss limit": skip setups whose structural stop is wider than this
 
 function finish(setup: SetupId, structure: Check[], trigger: Check[], p: Plan | null): SetupEval | null {
@@ -74,7 +88,11 @@ function newDump(s: CoinState, f: Features): SetupEval | null {
     c("Had an impulse (ATH ≥ 70◎ mcap)", f.athMcapSol >= 70, `${f.athMcapSol.toFixed(0)}◎`),
     c("First dump 45–80% off ATH", between(f.maxDrawdown, 0.45, 0.8), pct(f.maxDrawdown)),
     c("Launch cohorts known", f.tapeFromLaunch, f.tapeFromLaunch ? "yes" : "tape partial"),
-    c("Dev/snipers/bundles mostly out", f.tapeFromLaunch && (ins.soldFraction >= 0.5 || ins.heldPct <= 5), `sold ${pct(ins.soldFraction)}, hold ${ins.heldPct.toFixed(1)}%`),
+    c(
+      "Dev/snipers/bundles mostly out",
+      f.tapeFromLaunch && (ins.soldFraction >= 0.5 || ins.heldPct <= 5),
+      `sold ${pct(ins.soldFraction)}, hold ${ins.heldPct.toFixed(1)}%`,
+    ),
   ];
   const f60 = f.flow60s;
   const trigger = [
@@ -95,6 +113,7 @@ function stretchDeep(s: CoinState, f: Features): SetupEval | null {
     c("A big holder dumped (≥ 1.5%)", f.topSellerPct >= 1.5, `${f.topSellerPct.toFixed(1)}% of supply`),
     c("…and stopped selling", !f.topSellerActive, f.topSellerActive ? "still selling" : "quiet 60s"),
     c("Range held ≥ 2m", f.baseMin >= 2 && f.lowAgeMin >= 2, `${f.baseMin.toFixed(1)}m`),
+    graduationCheck(s, f),
   ];
   const f60 = f.flow60s;
   const trigger = [
@@ -115,6 +134,7 @@ function stretchPullback(s: CoinState, f: Features): SetupEval | null {
     c("Ordinary pullback 35–55%", between(f.maxDrawdown, 0.35, 0.55), pct(f.maxDrawdown)),
     c("Has a narrative (socials)", links > 0, `${links} links`),
     c("Low is ≥ 1m old", f.lowAgeMin >= 1, `${f.lowAgeMin.toFixed(1)}m`),
+    graduationCheck(s, f),
   ];
   const f60 = f.flow60s;
   const trigger = [
@@ -169,7 +189,7 @@ export function evaluateSetups(s: CoinState, dev: DevHistory): SetupEval[] {
   const f = s.features;
   if (!f || f.exhaustion === undefined) return [];
   const out = [newDump(s, f), stretchDeep(s, f), stretchPullback(s, f), devBase(s, f, dev), migratedBase(s, f)].filter(
-    (x): x is SetupEval => x !== null
+    (x): x is SetupEval => x !== null,
   );
   return out.sort((a, b) => (a.status === b.status ? b.quality - a.quality : a.status === "fire" ? -1 : 1));
 }

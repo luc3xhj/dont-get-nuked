@@ -81,13 +81,16 @@ function release(s: HostState) {
 export class HttpError extends Error {
   constructor(
     public status: number,
-    message: string
+    message: string,
   ) {
     super(message);
   }
 }
 
-export async function getJson<T = unknown>(url: string, opts: { limit?: number; timeoutMs?: number; headers?: Record<string, string> } = {}): Promise<T> {
+export async function getJson<T = unknown>(
+  url: string,
+  opts: { limit?: number; timeoutMs?: number; headers?: Record<string, string> } = {},
+): Promise<T> {
   const s = host(url, opts.limit ?? 4);
   await acquire(s);
   try {
@@ -115,6 +118,17 @@ export async function getJson<T = unknown>(url: string, opts: { limit?: number; 
 
 export function httpStats() {
   return Object.fromEntries(
-    [...hosts].map(([h, s]) => [h, { ok: s.ok, errors: s.errors, active: s.active, queued: s.queue.length, pausedForMs: Math.max(0, s.pausedUntil - Date.now()), perMin: s.perMin, lastError: s.lastError }])
+    [...hosts].map(([h, s]) => [
+      h,
+      {
+        ok: s.ok,
+        errors: s.errors,
+        active: s.active,
+        queued: s.queue.length,
+        pausedForMs: Math.max(0, s.pausedUntil - Date.now()),
+        perMin: s.perMin,
+        lastError: s.lastError,
+      },
+    ]),
   );
 }

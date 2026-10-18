@@ -3,7 +3,7 @@
 import ActivityFeed from "@/components/ActivityFeed";
 import EquityChart from "@/components/EquityChart";
 import { ClosedTrades, OpenPositions } from "@/components/PositionsTable";
-import { pctSigned, solSigned, type AgentState, type PortfolioReport } from "@/lib/agent";
+import { pctSigned, REGIME_TONE, solSigned, type AgentState, type PortfolioReport } from "@/lib/agent";
 import { fmtCompact, pnlColor } from "@/lib/format";
 import { usePolling, useSolPrice } from "@/lib/hooks";
 
@@ -85,6 +85,21 @@ export default function Dashboard() {
             <span>in positions {a.positions.toFixed(3)}◎</span>
             <span>started with {a.startCash}◎</span>
           </div>
+          {st && (
+            <div className={`mt-3 rounded-lg border px-3 py-2 text-xs ${REGIME_TONE[st.regime.level]}`}>
+              <span className="font-semibold capitalize">Market regime: {st.regime.level}</span>
+              <span className="text-zinc-400">
+                {" — "}
+                {st.regime.level === "bad" ? "no new entries" : st.regime.level === "caution" ? "half size" : "full size"} ·{" "}
+                {st.regime.reasons.join("; ")}
+              </span>
+              <div className="num mt-0.5 text-zinc-500">
+                SOL {st.regime.solChange1h === null ? "–" : pctSigned(st.regime.solChange1h, 1)} 1h · graduations 2h{" "}
+                {st.regime.graduations2h ?? "warming up"} · launches 1h {st.regime.launches1h} · benchmark{" "}
+                {st.regime.benchmarkAvgR === null ? "–" : `${st.regime.benchmarkAvgR.toFixed(2)}R`} (last {st.regime.benchmarkTrades})
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-zinc-800 bg-zinc-800">

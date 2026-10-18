@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 import EquityChart from "@/components/EquityChart";
 import { ClosedTrades } from "@/components/PositionsTable";
-import { pctSigned, SETUP_LABEL, type Account, type PortfolioReport, type Stats } from "@/lib/agent";
+import { pctSigned, SETUP_LABEL, type Account, type DatasetSummary, type PortfolioReport, type Stats } from "@/lib/agent";
 import { fmtAge, pnlColor } from "@/lib/format";
 import { usePolling } from "@/lib/hooks";
 
@@ -31,6 +31,7 @@ const statCells = (s: Stats | undefined) =>
 export default function Performance() {
   const { data, error } = usePolling<PortfolioReport>("/api/agent/portfolio", 4_000);
   const [showBenchmarks, setShowBenchmarks] = useState(false);
+  const { data: ds } = usePolling<DatasetSummary>("/api/agent/dataset", 30_000);
   if (!data) return <div className="py-20 text-center text-zinc-500">{error ?? "Loading…"}</div>;
 
   const acct = (id: Account["id"]) => data.accounts.find((a) => a.id === id)!;
@@ -185,11 +186,40 @@ export default function Performance() {
                   ? `exploring (${d.n}/15 benchmark trades) · half risk`
                   : `benchmark ${d.n} trades · ${(d.p * 100).toFixed(0)}% wins`}{" "}
                 · size {d.sizeSol.toFixed(3)}◎ · analyst {d.analyst.verdict} ×{d.analyst.conviction.toFixed(2)}
+                {d.regime && ` · regime ${d.regime.level}`}
               </div>
               {d.reasons.length > 0 && <div className="mt-0.5 text-zinc-400">{d.reasons.join(" · ")}</div>}
             </div>
           ))}
         </div>
+      </section>
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-950">
+        <div className="flex items-center border-b border-zinc-800 px-4 py-2 text-[11px] uppercase tracking-wide text-zinc-500">
+          Early-life rug dataset
+          <a href="/api/agent/dataset-csv" download className="ml-auto normal-case text-zinc-400 underline hover:text-white">
+            Download CSV
+          </a>
+        </div>
+        <div className="num flex flex-wrap gap-x-6 gap-y-1 px-4 py-3 text-sm">
+          <span>
+            <span className="text-zinc-500">captured</span> {ds?.captured ?? "…"}
+            {ds && <span className="text-zinc-600"> ({ds.sampled} random samples)</span>}
+          </span>
+          <span>
+            <span className="text-zinc-500">labeled at 1h</span> {ds?.labeled ?? "…"}
+          </span>
+          <span>
+            <span className="text-zinc-500">rug rate</span> {ds?.rugRate == null ? "–" : `${(ds.rugRate * 100).toFixed(0)}%`}
+          </span>
+          <span>
+            <span className="text-zinc-500">graduated</span> {ds?.graduated ?? "…"}
+          </span>
+        </div>
+        <p className="px-4 pb-3 text-[11px] text-zinc-600">
+          First-five-minute features (per “Catching the Rug”, arXiv 2608.20271) for every coin whose tape reaches launch, labeled one hour later. Once
+          it has a few thousand rows, a classifier trained on it can become a screen.
+        </p>
       </section>
 
       <section className="rounded-xl border border-zinc-800 bg-zinc-950">
