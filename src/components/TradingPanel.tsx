@@ -17,6 +17,7 @@ type Account = {
   lossStreak: number;
   stats: Stats;
   bySetup: Record<string, Stats>;
+  byAnalyst: Record<string, Stats>;
   curve: [number, number][];
 };
 type Plan = { entrySol: number; stopSol: number; tp1Sol: number; tp2Sol: number; maxHoldMin: number };
@@ -62,6 +63,7 @@ type Decision = {
   p: number;
   mode: "explore" | "evidence";
   n: number;
+  analyst: { verdict: string; conviction: number; note: string };
   reasons: string[];
 };
 type Report = {
@@ -256,6 +258,13 @@ export default function TradingPanel() {
                     : `shadow ${d.n} trades · ${(d.p * 100).toFixed(0)}% wins · edge ${pct(d.ev, 1)}`}{" "}
                   · size {d.sizeSol.toFixed(3)}◎
                 </div>
+                <div className="mt-0.5 text-zinc-500">
+                  Analyst:{" "}
+                  <span className={d.analyst.verdict === "reject" ? "text-rose-300" : d.analyst.verdict === "approve" ? "text-emerald-300" : ""}>
+                    {d.analyst.verdict}
+                  </span>{" "}
+                  ×{d.analyst.conviction.toFixed(2)} — {d.analyst.note}
+                </div>
                 {d.reasons.length > 0 && <div className="mt-0.5 text-zinc-400">{d.reasons.join(" · ")}</div>}
               </div>
             ))}
@@ -311,6 +320,26 @@ export default function TradingPanel() {
               </tr>
             </tbody>
           </table>
+          <div className="border-t border-zinc-800 px-4 py-2 text-[11px] uppercase tracking-wide text-zinc-500">
+            Shadow book by analyst verdict at entry
+          </div>
+          <div className="flex flex-wrap gap-4 px-4 pb-2 text-xs">
+            {(["approve", "neutral", "reject", "none"] as const).map((v) => {
+              const st = data.accounts.find((a) => a.id === "shadow")!.byAnalyst?.[v];
+              return (
+                <span key={v} className="num">
+                  <span className="text-zinc-400">{v}</span>{" "}
+                  {st ? (
+                    <>
+                      {st.trades} · {(st.winRate * 100).toFixed(0)}% · <span className={pnlColor(st.avgR)}>{st.avgR.toFixed(2)}R</span>
+                    </>
+                  ) : (
+                    <span className="text-zinc-600">–</span>
+                  )}
+                </span>
+              );
+            })}
+          </div>
           <p className="px-4 pb-3 text-[11px] text-zinc-600">
             A setup has an edge only if its shadow avg R beats the random baseline after costs, over hundreds of trades.
           </p>

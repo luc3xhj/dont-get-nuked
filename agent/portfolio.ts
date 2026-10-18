@@ -6,6 +6,7 @@
 import { db, journal } from "./db";
 import { fillBuy, fillSell, latency, liquidationValue, maxSizeForImpact, roundTripCost } from "./execution";
 import { SETUP_LABEL, type Plan, type SetupEval, type SetupId } from "./setups";
+import type { Analysis } from "./analyst";
 import { verdict } from "./screens";
 import { coins, type CoinState } from "./state";
 
@@ -30,6 +31,8 @@ export const RISK = {
   /** Below this many shadow trades a setup is "exploring": the agent trades it at reduced risk. */
   minEvidence: 15,
   explorationRiskScale: 0.5,
+  /** Size multiplier when the analyst hasn't judged the coin yet. */
+  noAnalysisScale: 0.5,
   /** Required shrunk avg R (after costs) once a setup has evidence. */
   minEdgeR: 0.05,
   /** Assume stops gap this much past the stop price in a fast market. */
@@ -67,6 +70,8 @@ export type Position = {
   liquidityAtEntry: number | null;
   /** Screen vetoes already present at entry; only new ones trigger a thesis exit. */
   entryVetoes: string[];
+  /** Analyst verdict when the position opened ("none" if there wasn't a fresh one). */
+  analystAtEntry: Analysis["verdict"] | "none";
   evidence: string[];
   exiting: boolean;
 };
@@ -87,6 +92,7 @@ export type Closed = {
   r: number;
   exitReason: string;
   holdMin: number;
+  analystAtEntry: Analysis["verdict"] | "none";
 };
 
 type Order = {
@@ -231,6 +237,8 @@ export function setupEvidence(setup: SetupId) {
 
 // ---------- entries ----------
 
+const freshAnalysis = (s: CoinState) => (s.analysis && s.analysis.expiresAt > Date.now() ? s.analysis : null);
+
 const uid = () => crypto.randomUUID();
 const openFor = (account: AccountId, mint: string) => [...positions.values()].some((p) => p.account === account && p.mint === mint);
 const pendingFor = (account: AccountId, mint: string) => orders.some((o) => o.account === account && o.mint === mint);
@@ -255,7 +263,16 @@ function placeBuy(account: AccountId, s: CoinState, solIn: number, setup: SetupI
   journal("order", s.coin.mint, { account, side: "buy", solIn, setup, plan, reason });
 }
 
-export type Decision = { take: boolean; sizeSol: number; reasons: string[]; ev: number; p: number; mode: "explore" | "evidence"; n: number };
+export type Decision = {
+  take: boolean;
+  sizeSol: number;
+  reasons: string[];
+  ev: number;
+  p: number;
+  mode: "explore" | "evidence";
+  n: number;
+  analyst: { verdict: Analysis["verdict"] | "none"; conviction: number; note: string };
+};
 
 /** The agent's judgment on a fired setup. Every reason is journaled for calibration. */
 export function decide(s: CoinState, ev: SetupEval): Decision {
@@ -285,7 +302,13 @@ export function decide(s: CoinState, ev: SetupEval): Decision {
   if (open >= RISK.maxOpen) reasons.push(`${open} positions open (max ${RISK.maxOpen})`);
 
   // Size from risk: lose ~riskPerTrade of equity if the stop is hit (with gap) and costs are paid.
-  const riskScale = mode === "explore" ? RISK.explorationRiskScale : 1;
+  // The analyst's slow-lane judgment: a reject blocks, conviction scales size, no verdict trades half size.
+  const an = freshAnalysis(s);
+  const analyst = an
+    ? { verdict: an.verdict, conviction: an.conviction, note: an.verdict === "reject" ? (an.redFlags[0] ?? an.thesis) : an.narrative }
+    : { verdict: "none" as const, conviction: RISK.noAnalysisScale, note: "No fresh analyst verdict" };
+  if (an?.verdict === "reject") reasons.push(`Analyst rejected: ${analyst.note}`);
+  const riskScale = (mode === "explore" ? RISK.explorationRiskScale : 1) * analyst.conviction;
   let size = (equity * RISK.riskPerTrade * riskScale) / (risk * RISK.stopGap + roundTripCost(s, 0.5));
   size = Math.min(size, equity * RISK.maxPositionFraction, maxSizeForImpact(s, RISK.maxImpact), a.cash * 0.95);
   if (size < RISK.minOrderSol) reasons.push(`Size ${size.toFixed(3)}◎ below minimum (thin pool or little cash)`);
@@ -295,7 +318,7 @@ export function decide(s: CoinState, ev: SetupEval): Decision {
   if (mode === "evidence" && evd.shrunkR < RISK.minEdgeR)
     reasons.push(`No edge yet: shadow avg ${evd.avgR.toFixed(2)}R over ${evd.n} trades (${(evd.winRate * 100).toFixed(0)}% wins)`);
 
-  return { take: reasons.length === 0, sizeSol: size, reasons, ev: evFrac, p: evd.winRate, mode, n: evd.n };
+  return { take: reasons.length === 0, sizeSol: size, reasons, ev: evFrac, p: evd.winRate, mode, n: evd.n, analyst };
 }
 
 /** Called each evaluation with a coin's fired setups. */
@@ -381,6 +404,7 @@ function closePosition(p: Position, reason: string) {
     r: riskSol ? pnl / riskSol : 0,
     exitReason: reason,
     holdMin: (Date.now() - p.openedAt) / 60_000,
+    analystAtEntry: p.analystAtEntry ?? "none",
   };
   db.prepare("INSERT OR REPLACE INTO closed (id, account, setup, closed_at, data) VALUES (?, ?, ?, ?, ?)").run(
     c.id,
@@ -446,6 +470,7 @@ function processOrders() {
         highSol: fill.priceSol,
         liquidityAtEntry: s.quote?.liquidityUsd || null,
         entryVetoes: s.screens.filter((x) => x.level === "veto").map((x) => x.id),
+        analystAtEntry: freshAnalysis(s)?.verdict ?? "none",
         evidence: o.evidence ?? [],
         exiting: false,
       };
@@ -541,6 +566,8 @@ function manage(p: Position) {
     (x) => x.level === "veto" && (x.id === "insiders" || x.id === "bundles" || x.id === "liquidity") && !(p.entryVetoes ?? []).includes(x.id),
   );
   if (newVeto) return placeSell(p, 1, `New veto: ${newVeto.label}`);
+  const an = freshAnalysis(s);
+  if (p.account === "agent" && an?.verdict === "reject" && an.at > p.openedAt) return placeSell(p, 1, "Analyst turned negative");
   if (p.liquidityAtEntry && s.quote.liquidityUsd && s.quote.liquidityUsd < p.liquidityAtEntry * 0.6) return placeSell(p, 1, "Liquidity pulled");
 }
 
@@ -588,6 +615,9 @@ export function portfolioReport() {
     const rows = closed.filter((c) => c.account === id);
     const bySetup: Record<string, ReturnType<typeof statsOf>> = {};
     for (const setup of new Set(rows.map((r) => r.setup))) bySetup[setup] = statsOf(rows.filter((r) => r.setup === setup));
+    // Does the analyst's verdict at entry predict outcomes? (Most meaningful on the shadow book.)
+    const byAnalyst: Record<string, ReturnType<typeof statsOf>> = {};
+    for (const v of new Set(rows.map((r) => r.analystAtEntry ?? "none"))) byAnalyst[v] = statsOf(rows.filter((r) => (r.analystAtEntry ?? "none") === v));
     return {
       id,
       ...equityOf(id),
@@ -597,6 +627,7 @@ export function portfolioReport() {
       lossStreak: a.lossStreak,
       stats: statsOf(rows),
       bySetup,
+      byAnalyst,
       curve: (db.prepare("SELECT ts, equity FROM equity WHERE account = ? ORDER BY ts").all(id) as { ts: number; equity: number }[]).map((r) => [
         r.ts,
         r.equity,

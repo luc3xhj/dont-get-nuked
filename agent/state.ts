@@ -4,6 +4,7 @@ import { CONFIG } from "./config";
 import { db, journal, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
 import { budget } from "./http";
 import { dsQuotes, GT_URL, gtTrades, holderReport, pumpList, socialReport, tradePage } from "./sources";
+import type { Analysis } from "./analyst";
 import type { SetupEval } from "./setups";
 import type { Coin, Features, HolderReport, Quote, ScreenResult, SocialReport, Trade } from "./types";
 
@@ -26,6 +27,8 @@ export type CoinState = {
   features: Features | null;
   screens: ScreenResult[];
   setups: SetupEval[];
+  /** Latest analyst verdict (may be expired; check expiresAt). */
+  analysis: Analysis | null;
 };
 
 export const coins = new Map<string, CoinState>();
@@ -55,6 +58,7 @@ function stateFor(coin: Coin): CoinState {
       features: null,
       screens: [],
       setups: [],
+      analysis: loadReport<Analysis>(coin.mint, "analysis"),
     };
     coins.set(coin.mint, s);
   } else {

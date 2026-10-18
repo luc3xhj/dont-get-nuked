@@ -21,12 +21,19 @@ function ctl(args, required = true) {
 }
 const loaded = () => ctl(["print", `${domain}/${label}`], false).status === 0;
 
+/** bootout returns before the job is gone; bootstrapping too early fails with an I/O error. */
+function unload() {
+  ctl(["bootout", `${domain}/${label}`], false);
+  for (let i = 0; i < 50 && loaded(); i++) spawnSync("/bin/sleep", ["0.1"]);
+}
+
 function writePlist() {
   mkdirSync(dirname(plist), { recursive: true });
   mkdirSync(logs, { recursive: true });
   if (existsSync(plist) && !readFileSync(plist, "utf8").includes(xml(root))) throw new Error("Existing service belongs to another directory");
   // `node --import tsx` runs the TypeScript worker in a single process launchd can supervise.
-  const args = [process.execPath, "--import", "tsx", resolve(root, "agent/main.ts")];
+  // Credentials (TREG_TOKEN, CLAUDE_BIN, …) come from .env.local, never from the plist.
+  const args = [process.execPath, `--env-file-if-exists=${resolve(root, ".env.local")}`, "--import", "tsx", resolve(root, "agent/main.ts")];
   writeFileSync(
     plist,
     `<?xml version="1.0" encoding="UTF-8"?>
@@ -54,7 +61,7 @@ ${args.map((a) => `    <string>${xml(a)}</string>`).join("\n")}
 
 const cmd = process.argv[2];
 if (cmd === "install") {
-  if (loaded()) ctl(["bootout", `${domain}/${label}`], false);
+  if (loaded()) unload();
   writePlist();
   ctl(["bootstrap", domain, plist]);
   console.log(`Installed ${plist}\nAgent API: http://127.0.0.1:3101 · logs: ${logs}`);
@@ -63,14 +70,14 @@ if (cmd === "install") {
   else ctl(["bootstrap", domain, plist]);
   console.log("Started");
 } else if (cmd === "stop") {
-  ctl(["bootout", `${domain}/${label}`], false);
+  unload();
   console.log("Stopped. It starts again at next login; use agent:uninstall to remove it.");
 } else if (cmd === "status") {
   const r = ctl(["print", `${domain}/${label}`], false);
   if (r.status !== 0) console.log("Service not loaded");
   else console.log(r.stdout.split("\n").filter((l) => /state =|pid =|last exit code|runs =/.test(l)).join("\n"));
 } else if (cmd === "uninstall") {
-  ctl(["bootout", `${domain}/${label}`], false);
+  unload();
   rmSync(plist, { force: true });
   console.log("Uninstalled. Data in agent/data is kept.");
 } else {

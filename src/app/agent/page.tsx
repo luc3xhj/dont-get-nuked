@@ -60,6 +60,21 @@ type SetupEval = {
   trigger: Check[];
   quality: number;
 };
+type Analysis = {
+  at: number;
+  expiresAt: number;
+  verdict: "approve" | "neutral" | "reject";
+  conviction: number;
+  narrativeType: string;
+  narrative: string;
+  contractVerified: "yes" | "no" | "unknown";
+  copycat: boolean;
+  redFlags: string[];
+  greenFlags: string[];
+  thesis: string;
+  wouldChangeMind: string;
+  sources: string[];
+};
 type HotCoin = {
   mint: string;
   symbol: string;
@@ -77,6 +92,7 @@ type HotCoin = {
   screens: Screen[];
   features: Features | null;
   setups: SetupEval[];
+  analysis: Analysis | null;
   held: boolean;
   curveProgress: number | null;
   social: {
@@ -108,6 +124,16 @@ type State = {
       lastError: string | null;
     }
   >;
+  analyst: {
+    status: string;
+    lastError: string | null;
+    callsLastHour: number;
+    maxPerHour: number;
+    model: string;
+    running: string | null;
+    bin: string | null;
+  };
+  treg: { configured: boolean; calls: number; failures: number; disabled: string | null; lastError: string | null };
   hot: HotCoin[];
 };
 type Trade = {
@@ -134,6 +160,25 @@ const LEVEL: Record<Screen["level"], string> = {
 };
 
 const sol = (v: number, d = 2) => `${v.toFixed(d)}◎`;
+
+const VERDICT: Record<Analysis["verdict"], string> = {
+  approve: "border-emerald-800 bg-emerald-500/10 text-emerald-300",
+  neutral: "border-zinc-700 bg-zinc-800 text-zinc-300",
+  reject: "border-rose-900 bg-rose-500/15 text-rose-300",
+};
+
+function VerdictChip({ a }: { a: Analysis | null }) {
+  if (!a) return null;
+  const stale = a.expiresAt < Date.now();
+  return (
+    <span
+      title={`${a.narrative}${a.redFlags.length ? `\nRed flags: ${a.redFlags.join("; ")}` : ""}`}
+      className={`inline-block rounded border px-1.5 py-0.5 text-[11px] ${VERDICT[a.verdict]} ${stale ? "opacity-50" : ""}`}
+    >
+      AI {a.verdict} ×{a.conviction.toFixed(2)}
+    </span>
+  );
+}
 
 function Meter({ value, tone = "emerald" }: { value: number; tone?: "emerald" | "violet" | "rose" }) {
   const color = {
@@ -220,6 +265,23 @@ export default function AgentConsole() {
           <span className="num">{data.stats.tracked} tracked</span>
           <span className="num">{data.stats.hot} deep-watched</span>
           <span className="num">{data.stats.tradesIngested.toLocaleString()} trades ingested</span>
+          <span
+            className={
+              data.analyst.status === "not-installed" || data.analyst.status === "not-logged-in" || data.analyst.status === "error"
+                ? "text-amber-400"
+                : "text-violet-300"
+            }
+            title={data.analyst.lastError ?? data.analyst.bin ?? ""}
+          >
+            analyst {data.analyst.running ? `researching ${data.analyst.running}` : data.analyst.status} · {data.analyst.callsLastHour}/
+            {data.analyst.maxPerHour} per h
+          </span>
+          <span
+            className={data.treg.configured && !data.treg.disabled ? "" : "text-amber-400"}
+            title={data.treg.disabled ?? data.treg.lastError ?? ""}
+          >
+            web search {data.treg.disabled ? "disabled" : data.treg.configured ? `${data.treg.calls} calls` : "not configured"}
+          </span>
           {Object.entries(data.http).map(([h, s]) => (
             <span key={h} className={`num ${s.errors > s.ok * 0.1 ? "text-amber-400" : ""}`} title={s.lastError ?? ""}>
               {h.split(".").slice(-2, -1)[0]} {s.ok}/{s.errors}
@@ -331,7 +393,8 @@ export default function AgentConsole() {
                             {x.status === "armed" && ` ${x.trigger.filter((k) => k.ok).length}/${x.trigger.length}`}
                           </div>
                         ))}
-                        {!c.held && !c.setups.length && <span className="text-xs text-zinc-700">–</span>}
+                        <VerdictChip a={c.analysis} />
+                        {!c.held && !c.setups.length && !c.analysis && <span className="text-xs text-zinc-700">–</span>}
                       </td>
                       <td className="px-3 py-2">
                         <div className="flex max-w-56 flex-wrap gap-1">
@@ -375,6 +438,40 @@ export default function AgentConsole() {
                         </button>
                       </div>
                     </div>
+                    {d.analysis && (
+                      <div className={`mt-3 rounded-lg border p-2.5 text-xs ${VERDICT[d.analysis.verdict]}`}>
+                        <div className="mb-1 flex justify-between font-semibold">
+                          <span>
+                            Analyst: {d.analysis.verdict} · {d.analysis.narrativeType} · ×{d.analysis.conviction.toFixed(2)}
+                          </span>
+                          <span className="font-normal opacity-70">
+                            {d.analysis.expiresAt < Date.now() ? "expired" : `valid ${Math.round((d.analysis.expiresAt - Date.now()) / 60_000)}m`}
+                          </span>
+                        </div>
+                        <div className="text-zinc-300">{d.analysis.narrative}</div>
+                        <div className="mt-1 text-zinc-400">{d.analysis.thesis}</div>
+                        <div className="mt-1 text-zinc-500">
+                          Contract verified: {d.analysis.contractVerified}
+                          {d.analysis.copycat && " · copycat"}
+                        </div>
+                        {d.analysis.greenFlags.map((g) => (
+                          <div key={g} className="text-emerald-300">
+                            + {g}
+                          </div>
+                        ))}
+                        {d.analysis.redFlags.map((r) => (
+                          <div key={r} className="text-rose-300">
+                            − {r}
+                          </div>
+                        ))}
+                        <div className="mt-1 text-zinc-500">Would change mind: {d.analysis.wouldChangeMind}</div>
+                        {d.analysis.sources.map((u) => (
+                          <a key={u} href={u} target="_blank" rel="noreferrer noopener" className="block truncate text-zinc-400 underline">
+                            {u}
+                          </a>
+                        ))}
+                      </div>
+                    )}
                     {d.setups.map((x) => (
                       <div key={x.setup} className="mt-3 rounded-lg border border-zinc-800 p-2.5 text-xs">
                         <div className={`mb-1 font-semibold ${x.status === "fire" ? "text-emerald-300" : "text-violet-300"}`}>

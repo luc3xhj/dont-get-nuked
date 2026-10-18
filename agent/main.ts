@@ -7,6 +7,8 @@ import { journal, prune } from "./db";
 import { computeFeatures } from "./features";
 import { httpStats } from "./http";
 import { runScreens, verdict } from "./screens";
+import { ANALYST, analystHealth, analystTick } from "./analyst";
+import { tregHealth } from "./research";
 import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio } from "./portfolio";
 import { evaluateSetups } from "./setups";
 import { coins, devHistory, laneOf, pinned, quoteTick, refreshUniverse, reportsTick, restore, stats, tapeTick, type CoinState } from "./state";
@@ -56,6 +58,7 @@ function summary(s: CoinState) {
     holders: s.holders && { at: s.holders.at, top10ExPoolPct: s.holders.top10ExPoolPct, totalHolders: s.holders.totalHolders, insidersDetected: s.holders.insidersDetected },
     social: s.social,
     setups: s.setups,
+    analysis: s.analysis,
     held: pinned.has(s.coin.mint),
     curveProgress: s.coin.curveProgress,
     mcapUsd: s.coin.mcapUsd,
@@ -83,6 +86,8 @@ const server = createServer((req, res) => {
       startedAt: stats.startedAt,
       stats: { ...stats, tracked: coins.size, hot: hot.length },
       http: httpStats(),
+      analyst: { ...analystHealth, callsLastHour: analystHealth.calls.length, maxPerHour: ANALYST.maxPerHour, model: ANALYST.model, calls: undefined },
+      treg: tregHealth,
       hot,
     });
   }
@@ -107,6 +112,7 @@ loop("universe", CONFIG.universe.refreshMs, refreshUniverse);
 loop("tape", 1_000, () => tapeTick(evaluate));
 loop("reports", 5_000, reportsTick);
 loop("quotes", 2_000, quoteTick);
+loop("analyst", 5_000, analystTick);
 // Re-evaluate every hot coin each second so time-based features (windows, exhaustion) stay current between trades.
 loop("evaluate", 1_000, async () => {
   for (const s of coins.values()) if (s.hot) evaluate(s);
