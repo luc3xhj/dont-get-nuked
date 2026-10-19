@@ -28,6 +28,8 @@ export type LedgerEvent = {
   orderId: string | null;
   positionId: string | null;
   decisionId: string | null;
+  /** Funded sleeve the cash movement belongs to (null = unallocated account capital). */
+  sleeve?: string | null;
   payload: Record<string, unknown>;
 };
 
@@ -74,11 +76,12 @@ export const hasOpening = (account: string) =>
  * the in-memory total is only updated after the insert succeeds (a rolled-back transaction is reloaded
  * by `resetLedgerCache`).
  */
-export function post(e: Omit<LedgerEvent, "seq" | "id" | "at" | "payload" | "mint" | "orderId" | "positionId" | "decisionId"> &
-  Partial<Pick<LedgerEvent, "id" | "at" | "payload" | "mint" | "orderId" | "positionId" | "decisionId">>): number {
+export function post(e: Omit<LedgerEvent, "seq" | "id" | "at" | "payload" | "mint" | "orderId" | "positionId" | "decisionId" | "sleeve"> &
+  Partial<Pick<LedgerEvent, "id" | "at" | "payload" | "mint" | "orderId" | "positionId" | "decisionId" | "sleeve">>): number {
   if (!Number.isInteger(e.cashLamports)) throw new Error(`Ledger amounts are integer lamports (got ${e.cashLamports})`);
   const before = cashLamports(e.account);
-  insert.run(
+  if (!hasSleeveColumn()) ensureSleeveColumn();
+  (e.sleeve ? insertWithSleeve() : insert).run(
     e.id ?? crypto.randomUUID(),
     e.account,
     e.type,
@@ -89,10 +92,67 @@ export function post(e: Omit<LedgerEvent, "seq" | "id" | "at" | "payload" | "min
     e.positionId ?? null,
     e.decisionId ?? null,
     JSON.stringify(e.payload ?? {}),
+    ...(e.sleeve ? [e.sleeve] : []),
   );
   totals.set(e.account, before + e.cashLamports);
   return toSol(before + e.cashLamports);
 }
+
+// ---------- sleeves: funded partitions of one account's cash ----------
+
+let sleeveCol: boolean | null = null;
+const hasSleeveColumn = () => (sleeveCol ??= (db.prepare("PRAGMA table_info(ledger_events)").all() as { name: string }[]).some((c) => c.name === "sleeve"));
+export function ensureSleeveColumn() {
+  if (!hasSleeveColumn()) db.exec("ALTER TABLE ledger_events ADD COLUMN sleeve TEXT");
+  sleeveCol = true;
+}
+let insertSleeve: ReturnType<typeof db.prepare> | null = null;
+const insertWithSleeve = () =>
+  (insertSleeve ??= db.prepare(
+    "INSERT INTO ledger_events (id, account, type, at, cash_lamports, mint, order_id, position_id, decision_id, payload, sleeve) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  ));
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS allocation_events (
+    id TEXT PRIMARY KEY,
+    account TEXT NOT NULL,
+    from_sleeve TEXT,
+    to_sleeve TEXT,
+    amount_lamports INTEGER NOT NULL,
+    at INTEGER NOT NULL,
+    reason TEXT NOT NULL
+  );
+`);
+
+/**
+ * Moves capital between unallocated cash (null) and sleeves. Zero account cash delta: allocation is
+ * attribution, never income. Must run inside the caller's transaction.
+ */
+export function allocate(account: string, from: string | null, to: string | null, amountLamports: number, reason: string, at = Date.now()) {
+  if (!Number.isInteger(amountLamports) || amountLamports <= 0) throw new Error("Allocation amounts are positive integer lamports");
+  db.prepare("INSERT INTO allocation_events (id, account, from_sleeve, to_sleeve, amount_lamports, at, reason) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+    crypto.randomUUID(),
+    account,
+    from,
+    to,
+    amountLamports,
+    at,
+    reason,
+  );
+}
+
+/** A sleeve's cash: allocations in − out + its own trading cash flows. */
+export function sleeveCashLamports(account: string, sleeve: string): number {
+  ensureSleeveColumn();
+  const alloc = db
+    .prepare(
+      "SELECT COALESCE(SUM(CASE WHEN to_sleeve = ? THEN amount_lamports ELSE 0 END) - SUM(CASE WHEN from_sleeve = ? THEN amount_lamports ELSE 0 END), 0) AS n FROM allocation_events WHERE account = ?",
+    )
+    .get(sleeve, sleeve, account) as { n: number };
+  const flows = db.prepare("SELECT COALESCE(SUM(cash_lamports), 0) AS n FROM ledger_events WHERE account = ? AND sleeve = ?").get(account, sleeve) as { n: number };
+  return alloc.n + flows.n;
+}
+export const hasAllocations = (account: string) => !!db.prepare("SELECT 1 FROM allocation_events WHERE account = ?").get(account);
 
 /** Drops cached totals (after a rollback, or in tests). */
 export const resetLedgerCache = () => totals.clear();

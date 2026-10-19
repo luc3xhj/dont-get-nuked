@@ -4,7 +4,7 @@
 import { codexBin, runCodex } from "./codex";
 import { journal, saveReport } from "./db";
 import { buildEvidence } from "./research";
-import { enqueue, finishJob, nextJob, startJob } from "./jobs";
+import { enqueue, finishJob, handlerFor, nextJob, startJob } from "./jobs";
 import { coins, pinned, type CoinState } from "./state";
 import type { ResearchBundle } from "../src/lib/research-types";
 
@@ -180,6 +180,27 @@ export async function analystTick() {
   enqueueResearch(now);
   const job = nextJob(now);
   if (!job) return;
+  // Other job types share the same budget and the same isolated, read-only model process.
+  if (job.type !== "token_research") {
+    const handler = handlerFor(job.type);
+    if (!handler) return finishJob(job.id, "skipped", { error: `no handler for ${job.type}` });
+    startJob(job.id, now);
+    analystHealth.status = "running";
+    analystHealth.running = job.type;
+    analystHealth.calls.push(now);
+    try {
+      const r = await handler(job);
+      finishJob(job.id, r.status, { reportId: r.reportId, error: r.error });
+      analystHealth.status = "idle";
+    } catch (e) {
+      finishJob(job.id, "failed", { error: e instanceof Error ? e.message : String(e) });
+      analystHealth.status = "error";
+      analystHealth.lastError = e instanceof Error ? e.message : String(e);
+    } finally {
+      analystHealth.running = null;
+    }
+    return;
+  }
   const s = coins.get(job.subject);
   if (!s) {
     finishJob(job.id, "skipped", { error: "coin no longer tracked" });

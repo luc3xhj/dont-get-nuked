@@ -7,10 +7,24 @@ import { NETWORK_FEE_SOL } from "../src/lib/amm";
 import { CONFIG } from "./config";
 import { db, journal } from "./db";
 import { costModel, decideFrom, POST_TP1_STOP, TP1_FRACTION, type DecisionResult, type DecisionSnapshot } from "./decision";
-import { cashLamports, hasOpening, positionNetLamports, post, resetLedgerCache, toLamports, toSol } from "./ledger";
+import {
+  allocate,
+  cashLamports,
+  ensureSleeveColumn,
+  hasAllocations,
+  hasOpening,
+  positionNetLamports,
+  post,
+  resetLedgerCache,
+  sleeveCashLamports,
+  toLamports,
+  toSol,
+} from "./ledger";
 import { EXEC, fillBuy, fillSell, latency, liquidationValue, poolOf, seededRandom } from "./execution";
 import { essentialsFor } from "./requirements";
-import { SETUP_LABEL, type Plan, type SetupEval, type SetupId } from "./setups";
+import { barsFor } from "./bars";
+import { CONTRACTS, SETUP_LABEL, SETUP_SLEEVE, type Plan, type SetupEval, type SetupId, type SleeveId } from "./setups";
+import type { Trade } from "./types";
 import type { Analysis } from "./analyst";
 import { regime } from "./regime";
 import { coins, type CoinState } from "./state";
@@ -21,7 +35,7 @@ import { analysisKey } from "./analysis-impact";
  * (measures research's net contribution) · shadow: every fired setup at a fixed size · baseline: random coins.
  * Each is a separately funded paper account with its own opening credit.
  */
-export type AccountId = "agent" | "rules" | "shadow" | "baseline";
+export type AccountId = "agent" | "rules" | "shadow" | "baseline" | "follower";
 
 export const RISK = {
   startCash: 10,
@@ -101,6 +115,11 @@ export type Position = {
   riskDefinitionVersion?: "approved_plan_v2" | "legacy_v1";
   /** Fees of failed exit attempts on this position (they are part of its net PnL). */
   feesSol?: number;
+  /** Follower experiment: the tracked wallet whose observed buy triggered this lot. */
+  leader?: string;
+  /** Funded sleeve (immutable) and the sleeve currently managing the lot (management transfer is disabled). */
+  sleeveId?: SleeveId;
+  managementSleeveId?: SleeveId;
 };
 
 export type Closed = {
@@ -163,6 +182,9 @@ type Order = {
   r0Sol?: number;
   /** The order can't be submitted at or after this time (entry orders: the signal's validity). */
   submitBy?: number;
+  /** Follower experiment: the tracked wallet whose buy triggered this order. */
+  leader?: string;
+  sleeve?: SleeveId;
 };
 
 // ---------- persistence ----------
@@ -181,7 +203,7 @@ db.exec(`
 `);
 
 const dayKey = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
-const IDS: AccountId[] = ["agent", "rules", "shadow", "baseline"];
+const IDS: AccountId[] = ["agent", "rules", "shadow", "baseline", "follower"];
 
 const accounts = new Map<AccountId, Account>();
 const positions = new Map<string, Position>();
@@ -244,6 +266,7 @@ export function restorePortfolio() {
     }
   // Cash is a projection of the ledger.
   for (const a of accounts.values()) if (hasOpening(a.id)) a.cash = toSol(cashLamports(a.id));
+  for (const id of IDS) initSleeves(id);
   // Orders survive restarts: buys past their timeout expire on the next tick, sells keep waiting for a price.
   orders.length = 0;
   for (const row of db.prepare("SELECT data FROM orders").all() as { data: string }[]) orders.push(JSON.parse(row.data) as Order);
@@ -274,6 +297,60 @@ function positionValue(p: Position): number | null {
 /** Cash held back for this account's pending buys. */
 export const reservedOf = (id: AccountId) => orders.filter((o) => o.account === id && o.side === "buy").reduce((t, o) => t + (o.reserveSol ?? 0), 0);
 export const spendableOf = (id: AccountId) => accounts.get(id)!.cash - reservedOf(id);
+
+// ---------- sleeves ----------
+
+/** Accounts whose capital is partitioned by holding horizon (the strategy and its comparator, identically). */
+const SLEEVED = new Set<AccountId>(["agent", "rules"]);
+/**
+ * Initial allocation (a configuration, not optimized weights): fast 60%, intraday 30%, 10% unallocated
+ * reserve. Swing and position stay unfunded until their data contracts qualify; reallocation is an
+ * explicit, zero-sum command.
+ */
+export const SLEEVE_PLAN: Record<SleeveId, number> = { fast: 0.6, intraday: 0.3, swing: 0, position: 0 };
+export const SLEEVES: SleeveId[] = ["fast", "intraday", "swing", "position"];
+
+const sleeveReserved = (id: AccountId, sleeve: SleeveId) =>
+  orders.filter((o) => o.account === id && o.side === "buy" && (o.sleeve ?? "fast") === sleeve).reduce((t, o) => t + (o.reserveSol ?? 0), 0);
+export function sleeveSpendable(id: AccountId, sleeve: SleeveId) {
+  if (!SLEEVED.has(id)) return spendableOf(id);
+  return toSol(sleeveCashLamports(id, sleeve)) - sleeveReserved(id, sleeve);
+}
+export function sleevesOf(id: AccountId) {
+  if (!SLEEVED.has(id)) return null;
+  const a = accounts.get(id)!;
+  const rows = SLEEVES.map((sl) => ({ sleeve: sl, cashSol: toSol(sleeveCashLamports(id, sl)), reservedSol: sleeveReserved(id, sl) }));
+  const allocated = rows.reduce((t, r) => t + r.cashSol, 0);
+  return { sleeves: rows, unallocatedSol: a.cash - allocated };
+}
+
+/** First run with sleeves: allocate the plan from current cash (one time, journaled). */
+function initSleeves(id: AccountId) {
+  if (!SLEEVED.has(id) || hasAllocations(id)) return;
+  ensureSleeveColumn();
+  const cash = toLamports(accounts.get(id)!.cash);
+  atomically(() => {
+    for (const sl of SLEEVES) {
+      const amt = Math.floor(cash * SLEEVE_PLAN[sl]);
+      if (amt > 0) allocate(id, null, sl, amt, "initial sleeve plan");
+    }
+    journal("sleeve_allocation", null, { account: id, plan: SLEEVE_PLAN, cashSol: toSol(cash) });
+  });
+}
+
+/** Moves unreserved cash between unallocated capital (null) and sleeves; never between accounts. */
+export function reallocate(id: AccountId, from: SleeveId | null, to: SleeveId | null, amountSol: number): ControlResult {
+  if (!SLEEVED.has(id)) return { status: "blocked", reasonCodes: ["account_not_sleeved"], detail: {} };
+  if (from === to || !(amountSol > 0)) return { status: "blocked", reasonCodes: ["invalid_allocation"], detail: {} };
+  const view = sleevesOf(id)!;
+  const available = from === null ? view.unallocatedSol - (reservedOf(id) - SLEEVES.reduce((t, sl) => t + sleeveReserved(id, sl), 0)) : sleeveSpendable(id, from);
+  if (available + 1e-12 < amountSol) return { status: "blocked", reasonCodes: ["insufficient_unreserved_cash"], detail: { availableSol: available } };
+  atomically(() => {
+    allocate(id, from, to, toLamports(amountSol), "operator reallocation");
+    journal("sleeve_allocation", null, { account: id, from, to, amountSol });
+  });
+  return { status: "applied", reasonCodes: [], detail: { from, to, amountSol } };
+}
 
 /**
  * Account equity. When any position can't be reliably valued, `complete` is false and `equity` is only
@@ -406,6 +483,10 @@ function placeBuy(
   if (!(r0Sol > 0) || !(plan.stopSol < plan.entrySol)) return reject("non_positive_planned_risk", { r0Sol });
   const reserveSol = solIn + NETWORK_FEE_SOL;
   if (spendableOf(account) < reserveSol) return reject("insufficient_funds", { spendable: spendableOf(account), required: reserveSol });
+  // A sleeve can't borrow another sleeve's idle cash.
+  const sleeve: SleeveId = setup === "random" ? "fast" : (SETUP_SLEEVE[setup] ?? "fast");
+  if (SLEEVED.has(account) && sleeveSpendable(account, sleeve) < reserveSol)
+    return reject("sleeve_insufficient_funds", { sleeve, spendable: sleeveSpendable(account, sleeve), required: reserveSol });
   const id = uid();
   const draws = drawSource(id);
   const o: Order = {
@@ -428,6 +509,7 @@ function placeBuy(
     draws,
     reserveSol,
     r0Sol,
+    sleeve: SLEEVED.has(account) ? sleeve : undefined,
     // The entry can't be submitted after its signal expires (each strategy declares its own TTL).
     submitBy: now + (plan.entryTtlMs ?? EXEC.orderTimeoutMs),
   };
@@ -481,7 +563,7 @@ export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now(), acc
     evidence: evd,
     account: {
       equity,
-      cash: spendableOf(accountId),
+      cash: sleeveSpendable(accountId, SETUP_SLEEVE[ev.setup] ?? "fast"),
       open: agentPositions.length + agentBuys.length,
       gate: riskGate(a),
       busy: openFor(accountId, s.coin.mint) || pendingFor(accountId, s.coin.mint),
@@ -593,6 +675,64 @@ export function onSignals(s: CoinState, fired: SetupEval[]) {
 }
 
 export const recentDecisions: ({ at: number; mint: string; symbol: string; setup: SetupId; essentials?: DecisionSnapshot["essentials"] } & Decision)[] = [];
+
+// ---------- follower experiment (wallet_follow_v1) ----------
+
+/**
+ * Registered follower policy, frozen before evaluation. It reacts to an observed buy by a tracked wallet
+ * after that buy becomes available to us, with its own current quote, size and exits; the leader's fill
+ * price is never inherited. These parameters are an experiment configuration, not calibrated values.
+ */
+export const FOLLOW_POLICY = {
+  version: "wallet_follow_v1",
+  minLeaderBuySol: 0.2,
+  /** Ignore observations older than this (our reaction window after receipt). */
+  maxSignalAgeMs: 10_000,
+  /** Skip if the price already ran this far past the leader's fill. */
+  maxDeterioration: 0.1,
+  sizeSol: 0.1,
+  stopPct: 0.15,
+  tp1Pct: 0.3,
+  tp2Pct: 0.6,
+  maxHoldMin: 20,
+};
+
+const followed = new Map<string, number>(); // mint -> last follow decision time
+/** Wallet trades observed on the tape: follow qualifying buys; a leader's sale closes only the follower's own lot. */
+export function followerOnTrades(s: CoinState, fresh: Trade[], isTracked: (wallet: string) => boolean, now = Date.now()) {
+  for (const t of fresh) {
+    if (!isTracked(t.wallet)) continue;
+    const received = t.receivedAt ?? now;
+    if (t.side === "sell") {
+      for (const p of positions.values())
+        if (p.account === "follower" && p.mint === s.coin.mint && p.leader === t.wallet && !p.exiting) placeSell(p, 1, "Leader sold (observed)");
+      continue;
+    }
+    if (t.sol < FOLLOW_POLICY.minLeaderBuySol || now - received > FOLLOW_POLICY.maxSignalAgeMs) continue;
+    if (openFor("follower", s.coin.mint) || pendingFor("follower", s.coin.mint) || now - (followed.get(s.coin.mint) ?? 0) < 10 * 60_000) continue;
+    if (!s.quote || now - s.quote.at > 10_000 || s.pulse?.status === "fail") continue;
+    followed.set(s.coin.mint, now);
+    const entry = s.quote.priceSol;
+    if (entry > t.priceSol * (1 + FOLLOW_POLICY.maxDeterioration)) {
+      journal("order_rejected", s.coin.mint, { account: "follower", code: "price_ran_past_leader", leaderPrice: t.priceSol, price: entry, leader: t.wallet });
+      continue;
+    }
+    const plan: Plan = {
+      entrySol: entry,
+      stopSol: entry * (1 - FOLLOW_POLICY.stopPct),
+      tp1Sol: entry * (1 + FOLLOW_POLICY.tp1Pct),
+      tp2Sol: entry * (1 + FOLLOW_POLICY.tp2Pct),
+      maxHoldMin: FOLLOW_POLICY.maxHoldMin,
+      entryTtlMs: CONTRACTS.wallet_follow.entryTtlMs,
+    };
+    const ok = placeBuy("follower", s, FOLLOW_POLICY.sizeSol, "wallet_follow", plan, [`Leader ${t.wallet.slice(0, 4)}… bought ${t.sol.toFixed(2)}◎`, `Policy ${FOLLOW_POLICY.version}`], "Follow tracked wallet");
+    if (ok) {
+      const o = orders.at(-1)!;
+      o.leader = t.wallet;
+      saveOrder(o);
+    }
+  }
+}
 
 /** Control: same size, timing and plan shape as the shadow entry, on a random other hot coin. */
 function openBaseline(trigger: CoinState, shape: Plan) {
@@ -715,7 +855,7 @@ function processOrders() {
           removeOrder(i);
           // A failed submitted attempt is an opportunity expense (no position exists).
           if (fill.feeSol > 0)
-            a.cash = post({ account: o.account, type: "attempt_fee", cashLamports: -toLamports(fill.feeSol), mint: o.mint, orderId: o.id, decisionId: o.decisionId ?? null, payload: { side: "buy", reason: fill.reason } });
+            a.cash = post({ account: o.account, type: "attempt_fee", cashLamports: -toLamports(fill.feeSol), mint: o.mint, orderId: o.id, decisionId: o.decisionId ?? null, sleeve: o.sleeve ?? null, payload: { side: "buy", reason: fill.reason } });
           saveAccount(a);
           journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy", reason: fill.reason, feeSol: fill.feeSol });
         });
@@ -751,10 +891,13 @@ function processOrders() {
         r0Sol: o.r0Sol,
         riskDefinitionVersion: o.r0Sol ? "approved_plan_v2" : "legacy_v1",
         feesSol: 0,
+        leader: o.leader,
+        sleeveId: o.sleeve,
+        managementSleeveId: o.sleeve,
       };
       atomically(() => {
         removeOrder(i);
-        a.cash = post({ account: o.account, type: "buy_fill", cashLamports: -toLamports(fill.sol), mint: o.mint, orderId: o.id, positionId: p.id, decisionId: o.decisionId ?? null, payload: { tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact } });
+        a.cash = post({ account: o.account, type: "buy_fill", cashLamports: -toLamports(fill.sol), mint: o.mint, orderId: o.id, positionId: p.id, decisionId: o.decisionId ?? null, sleeve: o.sleeve ?? null, payload: { tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact } });
         saveAccount(a);
         positions.set(p.id, p);
         savePosition(p);
@@ -783,7 +926,7 @@ function processOrders() {
           removeOrder(i);
           // A failed exit's fee belongs to the position's net PnL; inventory and TP state are unchanged.
           if (fill.feeSol > 0) {
-            a.cash = post({ account: o.account, type: "attempt_fee", cashLamports: -toLamports(fill.feeSol), mint: o.mint, orderId: o.id, positionId: p.id, payload: { side: "sell", reason: fill.reason, kind: o.kind ?? null } });
+            a.cash = post({ account: o.account, type: "attempt_fee", cashLamports: -toLamports(fill.feeSol), mint: o.mint, orderId: o.id, positionId: p.id, sleeve: p.sleeveId ?? null, payload: { side: "sell", reason: fill.reason, kind: o.kind ?? null } });
             p.feesSol = (p.feesSol ?? 0) + fill.feeSol;
           }
           p.exiting = false; // retry on the next tick
@@ -795,7 +938,7 @@ function processOrders() {
       }
       atomically(() => {
         removeOrder(i);
-        a.cash = post({ account: o.account, type: "sell_fill", cashLamports: toLamports(fill.sol), mint: o.mint, orderId: o.id, positionId: p.id, payload: { tokens: tokensIn, priceSol: fill.priceSol, reason: o.reason, kind: o.kind ?? null } });
+        a.cash = post({ account: o.account, type: "sell_fill", cashLamports: toLamports(fill.sol), mint: o.mint, orderId: o.id, positionId: p.id, sleeve: p.sleeveId ?? null, payload: { tokens: tokensIn, priceSol: fill.priceSol, reason: o.reason, kind: o.kind ?? null } });
         p.proceedsSol += fill.sol;
         p.tokens -= tokensIn;
         p.exiting = false;
@@ -867,7 +1010,14 @@ function manage(p: Position) {
   // TP1 counts as done only when this sell fills (a failed sell is retried on the next tick).
   if (!p.tp1Done && price >= p.plan.tp1Sol) return placeSell(p, TP1_FRACTION, "Take profit 1 (half)", null, null, "tp1");
   if (p.tp1Done) {
-    const trail = p.highSol * (1 - RISK.trailPct);
+    // Horizon lots trail on completed bars (lowest low of the last 3 minus the registered buffer);
+    // fast lots trail a fixed fraction under the high. The stop never loosens.
+    const tr = p.plan.trail;
+    let trail = p.highSol * (1 - RISK.trailPct);
+    if (tr) {
+      const done = barsFor(s, tr.barMs, 5 * tr.barMs).filter((b) => b.state === "ok").slice(-3);
+      trail = done.length === 3 ? Math.min(...done.map((b) => b.low)) - tr.buffer : p.stopSol;
+    }
     if (trail > p.stopSol) {
       p.stopSol = trail;
       savePosition(p);
@@ -963,6 +1113,7 @@ export function portfolioReport() {
     return {
       id,
       ...equityOf(id),
+      sleeves: sleevesOf(id),
       startCash: RISK.startCash,
       paused: a.paused,
       cooldownUntil: a.cooldownUntil,
@@ -1037,6 +1188,12 @@ export function reconciliationReport() {
     if (reserved > a.cash + 1e-9) issues.push(`${id}: pending buys reserve ${reserved.toFixed(4)} but cash is ${a.cash.toFixed(4)}`);
     return { id, cashSol: a.cash, ledgerCashSol: toSol(ledger), reservedSol: reserved, spendableSol: a.cash - reserved };
   });
+  for (const id of IDS) {
+    const v = sleevesOf(id);
+    if (!v) continue;
+    for (const sl of v.sleeves) if (sl.cashSol < -1e-9) issues.push(`${id}/${sl.sleeve}: negative sleeve cash ${sl.cashSol}`);
+    if (v.unallocatedSol < -1e-9) issues.push(`${id}: negative unallocated cash ${v.unallocatedSol}`);
+  }
   for (const p of positions.values()) {
     if (p.tokens < 0) issues.push(`position ${p.id}: negative inventory`);
     const legNet = toSol(positionNetLamports(p.id));

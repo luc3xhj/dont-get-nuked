@@ -6,7 +6,9 @@ import EvidencePanel from "../EvidencePanel";
 import { ClosedTrades, OpenPositions } from "../PositionsTable";
 import { AnalysisCard, CHANGED, DecisionCard } from "../research/ResearchCards";
 import { useTerminal } from "./data";
+import DiscoveryTab from "./DiscoveryTab";
 import Funnel from "./Funnel";
+import LearningTab from "./LearningTab";
 import SystemTab from "./SystemTab";
 import { TradersTab } from "./Traders";
 import { Metric } from "./ui";
@@ -23,6 +25,8 @@ const TABS: { id: DockTab; label: string }[] = [
   { id: "decisions", label: "Decisions" },
   { id: "research", label: "Research audit" },
   { id: "traders", label: "Traders" },
+  { id: "discovery", label: "Discovery" },
+  { id: "learning", label: "Learning" },
   { id: "performance", label: "Performance" },
   { id: "evidence", label: "What predicts winners" },
   { id: "dataset", label: "Rug dataset" },
@@ -48,6 +52,7 @@ const ACCOUNTS: { id: Account["id"]; label: string; blurb: string }[] = [
   { id: "rules", label: "Rules only", blurb: "Comparator: same policy and opportunities, research removed" },
   { id: "shadow", label: "Every setup", blurb: "Benchmark: all fired setups, 0.1◎, no filters" },
   { id: "baseline", label: "Random coins", blurb: "Benchmark: same timing and exits, random coins" },
+  { id: "follower", label: "Wallet follower", blurb: "Experiment: reacts to tracked wallets' buys with its own quotes and exits" },
 ];
 
 function Performance() {
@@ -351,6 +356,8 @@ export default function Dock({ layout, update, onSelect }: { layout: Layout; upd
         {layout.dockTab === "decisions" && <Decisions onSelect={onSelect} />}
         {layout.dockTab === "research" && <ResearchAudit />}
         {layout.dockTab === "traders" && <TradersTab onSelect={onSelect} />}
+        {layout.dockTab === "discovery" && <DiscoveryTab onSelect={onSelect} />}
+        {layout.dockTab === "learning" && <LearningTab />}
         {layout.dockTab === "performance" && <Performance />}
         {layout.dockTab === "evidence" && <EvidencePanel />}
         {layout.dockTab === "dataset" && <Dataset />}

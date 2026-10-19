@@ -24,7 +24,7 @@ test("migrations: verified backup, legacy cash imported once, invalid legacy R f
   );
 
   const first = runMigrations(MIGRATIONS);
-  assert.deepEqual(first.applied, [1, 2, 3]);
+  assert.deepEqual(first.applied, [1, 2, 3, 4]);
   assert.ok(first.backup && existsSync(first.backup), "a verified backup was written before migrating");
   assert.equal(ledger.toSol(ledger.cashLamports("agent")), 9.918, "cash = Σ ledger after import");
   const events = ledger.ledgerEvents({ account: "agent" });
@@ -36,6 +36,6 @@ test("migrations: verified backup, legacy cash imported once, invalid legacy R f
 
   const again = runMigrations(MIGRATIONS);
   assert.deepEqual(again.applied, [], "applied once");
-  assert.deepEqual(appliedVersions(), [1, 2, 3]);
+  assert.deepEqual(appliedVersions(), [1, 2, 3, 4]);
   assert.equal(ledger.ledgerEvents({ account: "agent" }).length, 2, "no second opening credit");
 });

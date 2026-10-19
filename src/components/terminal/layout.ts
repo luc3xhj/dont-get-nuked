@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-export type DockTab = "positions" | "trades" | "decisions" | "research" | "traders" | "performance" | "evidence" | "dataset" | "system";
+export type DockTab = "positions" | "trades" | "decisions" | "research" | "traders" | "discovery" | "learning" | "performance" | "evidence" | "dataset" | "system";
 export type FeedFilter = "all" | "trades" | "decisions" | "setups" | "research" | "traders";
 
 export type Layout = {

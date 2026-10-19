@@ -44,6 +44,23 @@ export type CoinState = {
 };
 
 export const coins = new Map<string, CoinState>();
+/**
+ * Extra attention requested by discovery (evidence or wallet leads), by mint: { boost, at }. It only
+ * raises observation priority among coins that already pass their filters; it never admits a coin.
+ */
+export const candidateBoost = new Map<string, number>();
+const boostAt = new Map<string, number>();
+export const boostOf = (mint: string, now = Date.now()) => {
+  const at = boostAt.get(mint);
+  if (!candidateBoost.has(mint)) return 0;
+  if (at === undefined) boostAt.set(mint, now);
+  else if (now - at > 30 * 60_000) {
+    candidateBoost.delete(mint);
+    boostAt.delete(mint);
+    return 0;
+  }
+  return candidateBoost.get(mint) ?? 0;
+};
 /** When we saw a tracked coin graduate (curve → PumpSwap), for the regime filter. Observed transitions only. */
 export const graduations: number[] = [];
 /** Mints that must stay deep-watched (open positions), set by the portfolio. */
@@ -226,7 +243,7 @@ function selectHot(now: number) {
   );
   const hot = new Set(keep);
   // Coins that pass every filter first, then those still being checked; attention breaks ties.
-  const rank = (s: CoinState) => (s.pulse?.status === "pass" ? 100 : 0) + liveScore(s);
+  const rank = (s: CoinState) => (s.pulse?.status === "pass" ? 100 : 0) + boostOf(s.coin.mint, now) + liveScore(s);
   const ranked = all.filter((s) => !hot.has(s) && eligible(s) && s.score > -Infinity).sort((a, b) => rank(b) - rank(a));
   // Fill each pool's share of slots first, then any leftover slots with the best of the rest.
   for (const [lane, slots] of Object.entries(CONFIG.universe.laneSlots) as [Lane, number][]) {

@@ -3,9 +3,11 @@
 //   discovered — wallets our own tape history ranks well: they repeatedly closed trades in profit
 // Everything here is computed from trades we already record, so it costs nothing. A watched trader
 // buying is evidence to measure, never an instruction to copy.
+import { createHash } from "node:crypto";
 import { CONFIG } from "./config";
 import { db, journal } from "./db";
 import { wilsonLower } from "./stats";
+import { touchCandidate } from "./discovery";
 import type { CoinState } from "./state";
 import type { Trade } from "./types";
 
@@ -72,6 +74,14 @@ db.exec(`
     sniped INTEGER NOT NULL, PRIMARY KEY (wallet, mint)
   ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS discovered_wallets (address TEXT PRIMARY KEY, score REAL NOT NULL, data TEXT NOT NULL);
+  -- Frozen cohort versions: membership as selected at that moment (departed and losing members stay in history).
+  CREATE TABLE IF NOT EXISTS wallet_cohorts (
+    cohort_version INTEGER PRIMARY KEY AUTOINCREMENT,
+    selected_at INTEGER NOT NULL,
+    selection_rule TEXT NOT NULL,
+    rule_hash TEXT NOT NULL,
+    members TEXT NOT NULL
+  );
 `);
 
 const ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -108,6 +118,94 @@ export function unwatchWallet(address: string) {
 // ---------- discovery ----------
 
 let discovered = new Map<string, DiscoveredWallet>();
+const RULE_HASH = createHash("sha256").update(JSON.stringify(DISCOVERY)).digest("hex").slice(0, 16);
+
+/** The cohort as it was selected at time `at` (null before the first selection): no hindsight membership. */
+export function cohortAt(at: number): { version: number; selectedAt: number; members: string[] } | null {
+  const r = db.prepare("SELECT cohort_version, selected_at, members FROM wallet_cohorts WHERE selected_at <= ? ORDER BY cohort_version DESC LIMIT 1").get(at) as
+    | { cohort_version: number; selected_at: number; members: string }
+    | undefined;
+  return r ? { version: r.cohort_version, selectedAt: r.selected_at, members: JSON.parse(r.members) } : null;
+}
+export const cohortVersions = () =>
+  (db.prepare("SELECT cohort_version, selected_at, rule_hash, members FROM wallet_cohorts ORDER BY cohort_version DESC LIMIT 20").all() as {
+    cohort_version: number;
+    selected_at: number;
+    rule_hash: string;
+    members: string;
+  }[]).map((r) => ({ version: r.cohort_version, selectedAt: r.selected_at, ruleHash: r.rule_hash, size: JSON.parse(r.members).length }));
+
+export type WalletEpisode = {
+  mint: string;
+  openedAt: number;
+  closedAt: number | null;
+  buys: number;
+  sells: number;
+  solIn: number;
+  solOut: number;
+  /** FIFO-matched realized PnL over known-basis inventory; null when a sale consumed unknown-basis tokens. */
+  realizedSol: number | null;
+  residualTokens: number;
+  /** Tokens sold that we never saw being bought (prior buys, transfers or airdrops): their basis is unknown. */
+  unknownBasisTokens: number;
+  status: "open" | "closed";
+};
+
+/**
+ * Reconstructs a wallet's episodes per coin from the stored tape with FIFO lots. Sales beyond the
+ * observed buys consume unknown-basis inventory; affected PnL stays unknown instead of invented.
+ */
+export function walletEpisodes(address: string): WalletEpisode[] {
+  const rows = db.prepare("SELECT mint, ts, side, sol, tokens FROM trades WHERE wallet = ? ORDER BY mint, id").all(address) as {
+    mint: string;
+    ts: number;
+    side: "buy" | "sell";
+    sol: number;
+    tokens: number;
+  }[];
+  const out: WalletEpisode[] = [];
+  let cur: (WalletEpisode & { lots: { tokens: number; costPerToken: number }[] }) | null = null;
+  const flush = () => {
+    if (!cur) return;
+    const { lots, ...e } = cur;
+    e.residualTokens = lots.reduce((a, l) => a + l.tokens, 0);
+    if (e.residualTokens <= 1e-6 && e.sells) {
+      e.status = "closed";
+      e.closedAt ??= e.openedAt;
+    }
+    out.push(e);
+    cur = null;
+  };
+  for (const t of rows) {
+    if (cur && cur.mint !== t.mint) flush();
+    if (!cur) cur = { mint: t.mint, openedAt: t.ts, closedAt: null, buys: 0, sells: 0, solIn: 0, solOut: 0, realizedSol: 0, residualTokens: 0, unknownBasisTokens: 0, status: "open", lots: [] };
+    if (t.side === "buy") {
+      cur.buys++;
+      cur.solIn += t.sol;
+      cur.lots.push({ tokens: t.tokens, costPerToken: t.sol / t.tokens });
+    } else {
+      cur.sells++;
+      cur.solOut += t.sol;
+      let left = t.tokens;
+      let basis = 0;
+      while (left > 1e-9 && cur.lots.length) {
+        const lot = cur.lots[0];
+        const take = Math.min(lot.tokens, left);
+        basis += take * lot.costPerToken;
+        lot.tokens -= take;
+        left -= take;
+        if (lot.tokens <= 1e-9) cur.lots.shift();
+      }
+      if (left > 1e-6) {
+        cur.unknownBasisTokens += left;
+        cur.realizedSol = null;
+      } else if (cur.realizedSol !== null) cur.realizedSol += t.sol - basis;
+      cur.closedAt = t.ts;
+    }
+  }
+  flush();
+  return out.sort((a, b) => b.openedAt - a.openedAt);
+}
 for (const r of db.prepare("SELECT data FROM discovered_wallets ORDER BY score DESC").all() as { data: string }[]) {
   const d = JSON.parse(r.data) as DiscoveredWallet;
   discovered.set(d.address, d);
@@ -192,6 +290,16 @@ export function discoverTraders(now = Date.now()) {
     })
     .sort((a, b) => b.score - a.score)
     .slice(0, DISCOVERY.top);
+  // A new cohort version whenever membership changes; earlier versions are never edited.
+  const members = ranked.map((d) => d.address).sort();
+  const last = db.prepare("SELECT members FROM wallet_cohorts ORDER BY cohort_version DESC LIMIT 1").get() as { members: string } | undefined;
+  if (!last || last.members !== JSON.stringify(members))
+    db.prepare("INSERT INTO wallet_cohorts (selected_at, selection_rule, rule_hash, members) VALUES (?, ?, ?, ?)").run(
+      now,
+      JSON.stringify(DISCOVERY),
+      RULE_HASH,
+      JSON.stringify(members),
+    );
   db.exec("DELETE FROM discovered_wallets");
   const ins = db.prepare("INSERT INTO discovered_wallets (address, score, data) VALUES (?, ?, ?)");
   for (const d of ranked) ins.run(d.address, d.score, JSON.stringify(d));
@@ -202,6 +310,8 @@ export function discoverTraders(now = Date.now()) {
 // ---------- per coin ----------
 
 const sourceOf = (address: string): TraderOnCoin["source"] | null => (watched.has(address) ? "watching" : discovered.has(address) ? "discovered" : null);
+/** A wallet the follower experiment may react to: watched by you, or in the current discovered cohort. */
+export const isTracked = (address: string) => sourceOf(address) !== null;
 
 /** Watched and discovered wallets that traded this coin, with their position from the tape. */
 export function tradersOnCoin(s: CoinState): TraderOnCoin[] {
@@ -267,6 +377,8 @@ export function onTrades(s: CoinState, fresh: Trade[], now = Date.now()) {
     if (!source || now - t.ts > 10 * 60_000) continue;
     const w = watched.get(t.wallet);
     const solUsd = s.quote && s.quote.priceSol ? s.quote.priceUsd / s.quote.priceSol : null;
+    // Wallet ingress: a tracked trader buying makes the coin a candidate (never a copy order).
+    if (t.side === "buy") touchCandidate(s.coin.mint, "wallet", { wallet: t.wallet, source, sol: t.sol }, now);
     journal("trader_trade", s.coin.mint, {
       wallet: t.wallet,
       name: w?.name ?? null,

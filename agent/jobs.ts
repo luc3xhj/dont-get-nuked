@@ -100,6 +100,12 @@ export function finishJob(id: string, status: "done" | "failed" | "skipped", det
   );
 }
 
+/** Handlers for job types other than token research (which the analyst runs itself). */
+type Handler = (job: Job) => Promise<{ status: "done" | "failed" | "skipped"; reportId?: string; error?: string }>;
+const handlers = new Map<JobType, Handler>();
+export const registerHandler = (type: JobType, fn: Handler) => handlers.set(type, fn);
+export const handlerFor = (type: JobType) => handlers.get(type);
+
 /** Jobs left running by a crash are failed on restart (their result never became available). */
 export function recoverJobs(now = Date.now()) {
   db.prepare("UPDATE research_jobs SET status = 'failed', completed_at = ?, error = 'interrupted by restart' WHERE status = 'running'").run(now);

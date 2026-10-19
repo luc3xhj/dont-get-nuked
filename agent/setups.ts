@@ -6,6 +6,9 @@ import { laneOf, type CoinState } from "./state";
 import { CONFIG } from "./config";
 import type { EpisodeView } from "./episodes";
 import { narrativeSupport } from "./requirements";
+import { atr, barsFor, coverageHours } from "./bars";
+import { capabilityState } from "./capabilities";
+import { narrativeEvidenceFor } from "./discovery";
 import type { Features } from "./types";
 
 export type SetupId =
@@ -17,7 +20,11 @@ export type SetupId =
   | "early_momentum"
   | "first_shallow_pullback"
   | "migration_event"
-  | "breakout_continuation";
+  | "breakout_continuation"
+  | "wallet_follow"
+  | "intraday_retest"
+  | "narrative_swing"
+  | "narrative_position";
 
 export const SETUP_LABEL: Record<SetupId, string> = {
   new_dump: "New pair · first dump",
@@ -29,6 +36,28 @@ export const SETUP_LABEL: Record<SetupId, string> = {
   first_shallow_pullback: "Fast · first shallow pullback",
   migration_event: "Fast · migration response",
   breakout_continuation: "Fast · breakout continuation",
+  wallet_follow: "Experiment · follow tracked wallet",
+  intraday_retest: "Intraday · range retest continuation",
+  narrative_swing: "Swing · narrative and flow continuation",
+  narrative_position: "Position · narrative persistence (gated)",
+};
+
+/** Funded sleeve (holding horizon) each strategy trades from. Horizons are intended ranges, not minimum holds. */
+export type SleeveId = "fast" | "intraday" | "swing" | "position";
+export const SETUP_SLEEVE: Record<SetupId, SleeveId> = {
+  new_dump: "fast",
+  stretch_deep: "fast",
+  stretch_pullback: "fast",
+  dev_base: "fast",
+  migrated_base: "fast",
+  early_momentum: "fast",
+  first_shallow_pullback: "fast",
+  migration_event: "fast",
+  breakout_continuation: "fast",
+  wallet_follow: "fast",
+  intraday_retest: "intraday",
+  narrative_swing: "swing",
+  narrative_position: "position",
 };
 
 /**
@@ -45,6 +74,17 @@ export const CONTRACTS: Record<SetupId, { maxTapeAgeMs: number | null; launchTap
   first_shallow_pullback: { maxTapeAgeMs: 20_000, launchTape: true, entryTtlMs: 20_000, family: "fast" },
   migration_event: { maxTapeAgeMs: 20_000, launchTape: false, entryTtlMs: 20_000, family: "fast" },
   breakout_continuation: { maxTapeAgeMs: 30_000, launchTape: false, entryTtlMs: 30_000, family: "fast" },
+  wallet_follow: { maxTapeAgeMs: 20_000, launchTape: false, entryTtlMs: 15_000, family: "fast" },
+  intraday_retest: { maxTapeAgeMs: 60_000, launchTape: false, entryTtlMs: 120_000, family: "fast" },
+  narrative_swing: { maxTapeAgeMs: 120_000, launchTape: false, entryTtlMs: 10 * 60_000, family: "fast" },
+  narrative_position: { maxTapeAgeMs: 300_000, launchTape: false, entryTtlMs: 30 * 60_000, family: "fast" },
+};
+
+/** Long-horizon data requirements (V2 §10). A strategy whose requirement isn't met is unsupported, not failing. */
+export const HORIZON_REQUIREMENTS = {
+  intraday_retest: { barMs: 5 * 60_000, minCompletedBars: 15, coverageHours: 1.25 },
+  narrative_swing: { barMs: 15 * 60_000, minCompletedBars: 96, coverageHours: 24 },
+  narrative_position: { barMs: 4 * 3600_000, minCompletedBars: 42, coverageHours: 7 * 24 },
 };
 
 export type Check = { label: string; ok: boolean; value: string };
@@ -57,6 +97,8 @@ export type Plan = {
   maxHoldMin: number;
   /** How long the entry signal stays valid for submission (an order can't submit after it). */
   entryTtlMs?: number;
+  /** Bar-based trailing after TP1: lowest low of the last 3 completed bars minus `buffer`. */
+  trail?: { barMs: number; buffer: number };
 };
 
 export type SetupEval = {
@@ -430,6 +472,122 @@ function breakoutContinuation(s: CoinState, f: Features): SetupEval | null {
   return finish("breakout_continuation", structure, trigger, withTtl(plan(f.priceSol, lo * 0.97, hi + h, hi + 2 * h, 10), "breakout_continuation"));
 }
 
+// ---------- longer horizons (V2 §10) ----------
+
+const median = (xs: number[]) => {
+  const v = [...xs].sort((a, b) => a - b);
+  return v.length ? v[Math.floor(v.length / 2)] : 0;
+};
+
+/**
+ * Intraday retest continuation: a 5-minute close above the range frozen from the 12 bars before the
+ * breakout, then a retest within 1–3 bars whose low enters [level − 0.5·ATR, level + 0.25·ATR] and closes
+ * back above it, with positive flow and buyers at least the median of the 6 bars before. ATR(14) is frozen
+ * from bars before the breakout. Triggers only while the retest bar is fresh (entry TTL 120s).
+ */
+function intradayRetest(s: CoinState, f: Features): SetupEval | null {
+  const req = HORIZON_REQUIREMENTS.intraday_retest;
+  const bars = barsFor(s, req.barMs, 3 * 3600_000, f.at);
+  const usable = bars.filter((b) => b.state !== "missing");
+  const structure: Check[] = [
+    ...readiness(s, f, "intraday_retest"),
+    c(`≥ ${req.minCompletedBars} completed 5m bars`, usable.length >= req.minCompletedBars, `${usable.length}`),
+    c("Liquidity ≥ $10k", (f.liquidityUsd ?? 0) >= 10_000, `$${Math.round((f.liquidityUsd ?? 0) / 1000)}k`),
+  ];
+  if (!structure.every((x) => x.ok)) return null;
+  // The retest is the latest completed bar; the breakout is 1–3 bars before it.
+  const r = usable.length - 1;
+  {
+    for (let k = r - 1; k >= r - 3 && k >= 14; k--) {
+      const range = usable.slice(k - 12, k);
+      const level = Math.max(...range.map((b) => b.high));
+      const a = atr(usable.slice(0, k), 14);
+      if (!a || usable[k].close <= level) continue;
+      const rb = usable[r];
+      const inBand = rb.low >= level - 0.5 * a && rb.low <= level + 0.25 * a;
+      const prior6 = usable.slice(r - 6, r).map((b) => b.buyers);
+      const fresh = f.at - rb.end <= CONTRACTS.intraday_retest.entryTtlMs;
+      const struct2 = [...structure, c("Breakout above the frozen 12-bar range", true, `close ${pct(usable[k].close / level - 1)} above`)];
+      const trigger = [
+        c("Retest low inside the ATR band", inBand, pct(rb.low / level - 1)),
+        c("Retest closed back above the level", rb.close > level, pct(rb.close / level - 1)),
+        c("Positive 5m net flow", rb.buySol - rb.sellSol > 0, `${(rb.buySol - rb.sellSol).toFixed(2)}◎`),
+        c("Buyers ≥ median of 6 prior bars", rb.buyers >= median(prior6), `${rb.buyers} vs ${median(prior6)}`),
+        c("Retest bar still fresh (entry TTL)", fresh, `${Math.round((f.at - rb.end) / 1000)}s`),
+      ];
+      const stop = rb.low - 0.25 * a;
+      const risk = f.priceSol - stop;
+      const p = risk > 0 ? plan(f.priceSol, stop, f.priceSol + 1.5 * risk, f.priceSol + 3 * risk, 360) : null;
+      return finish("intraday_retest", struct2, trigger, p ? { ...p, entryTtlMs: CONTRACTS.intraday_retest.entryTtlMs, trail: { barMs: req.barMs, buffer: 0.25 * a } } : null);
+    }
+  }
+  return null;
+}
+
+/**
+ * Narrative swing: needs 24h of continuous 15-minute coverage AND independently supported narrative
+ * evidence on a chain-validated mint, both available before the trigger. Hourly close above the frozen
+ * 12-hour high, positive flow in 3 of the last 4 hours, then a 15-minute retest within 0.25·ATR.
+ */
+function narrativeSwing(s: CoinState, f: Features): SetupEval | null {
+  const req = HORIZON_REQUIREMENTS.narrative_swing;
+  const bars15 = barsFor(s, req.barMs, 26 * 3600_000, f.at);
+  const cov = coverageHours(bars15);
+  const ev = narrativeEvidenceFor(s.coin.mint);
+  const structure: Check[] = [
+    ...readiness(s, f, "narrative_swing"),
+    c("24h continuous coverage", cov >= req.coverageHours, `${cov.toFixed(1)}h`),
+    c("Narrative evidence: ≥ 2 independent origins on a validated mint", ev.chainValidated && ev.independentOrigins >= 2, `${ev.independentOrigins} origins`),
+  ];
+  if (!structure.every((x) => x.ok)) return null;
+  const hourly = barsFor(s, 3600_000, 26 * 3600_000, f.at).filter((b) => b.state !== "missing");
+  if (hourly.length < 14) return null;
+  const k = hourly.length - 1;
+  const level = Math.max(...hourly.slice(k - 12, k).map((b) => b.high));
+  const flowUp = hourly.slice(-4).filter((b) => b.buySol > b.sellSol).length;
+  const q = bars15.filter((b) => b.state !== "missing");
+  const a = atr(q.slice(0, -1), 12);
+  const rb = q[q.length - 1];
+  const trigger = [
+    c("Hourly close above the 12h high", hourly[k].close > level, pct(hourly[k].close / level - 1)),
+    c("Positive flow in 3 of the last 4 hours", flowUp >= 3, `${flowUp}/4`),
+    c("15m retest within 0.25·ATR of the level", !!a && Math.abs(rb.low - level) <= 0.25 * a && rb.close > level, a ? pct(rb.low / level - 1) : "–"),
+  ];
+  const stop = rb.low - 0.25 * (a ?? 0);
+  const risk = f.priceSol - stop;
+  const p = risk > 0 ? plan(f.priceSol, stop, f.priceSol + 2 * risk, f.priceSol + 4 * risk, 7 * 24 * 60) : null;
+  return finish("narrative_swing", structure, trigger, p ? { ...p, entryTtlMs: CONTRACTS.narrative_swing.entryTtlMs, trail: { barMs: 3600_000, buffer: 0.25 * (a ?? 0) } } : null);
+}
+
+/** Readiness of each strategy's data contract right now, with the exact reason when unsupported. */
+export function strategyReadiness(): { setup: SetupId; sleeve: SleeveId; state: "supported" | "unsupported"; reason: string }[] {
+  const longest = Math.max(0, ...[...coinsForReadiness()].map((s) => coverageHours(barsFor(s, 15 * 60_000, 26 * 3600_000))));
+  return (Object.keys(SETUP_SLEEVE) as SetupId[]).map((setup) => {
+    const sleeve = SETUP_SLEEVE[setup];
+    if (setup === "narrative_position")
+      return { setup, sleeve, state: "unsupported" as const, reason: "Requires 7 days of complete 4-hour history and narrative persistence; free routes keep 24h of tape and coins are deep-watched briefly." };
+    if (setup === "narrative_swing")
+      return longest >= 24
+        ? { setup, sleeve, state: "supported" as const, reason: "24h coverage available on at least one coin" }
+        : { setup, sleeve, state: "unsupported" as const, reason: `Requires 24h continuous coverage; longest current coverage ${longest.toFixed(1)}h` };
+    if (setup === "migration_event")
+      return {
+        setup,
+        sleeve,
+        state: "supported" as const,
+        reason:
+          capabilityState("pumpportal.migration") === "qualified"
+            ? "Migration times from the live stream or pool creation"
+            : "Migration times from pool creation only (stream migration not yet live-checked)",
+      };
+    return { setup, sleeve, state: "supported" as const, reason: "Contract checked per coin at decision time" };
+  });
+}
+let coinsForReadiness: () => Iterable<CoinState> = () => [];
+export const setReadinessUniverse = (fn: () => Iterable<CoinState>) => {
+  coinsForReadiness = fn;
+};
+
 export function evaluateSetups(s: CoinState, dev: DevHistory): SetupEval[] {
   const f = s.features;
   if (!f || f.exhaustion === undefined) return [];
@@ -443,6 +601,8 @@ export function evaluateSetups(s: CoinState, dev: DevHistory): SetupEval[] {
     firstShallowPullback(s, f),
     migrationEvent(s, f),
     breakoutContinuation(s, f),
+    intradayRetest(s, f),
+    narrativeSwing(s, f),
   ].filter((x): x is SetupEval => x !== null);
   return out.sort((a, b) => (a.status === b.status ? b.quality - a.quality : a.status === "fire" ? -1 : 1));
 }

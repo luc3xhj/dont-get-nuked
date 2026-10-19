@@ -2,6 +2,7 @@
 
 // System: is the worker healthy, which data routes are actually usable, what research is queued,
 // and do the books reconcile. Connectivity, freshness and qualification are separate fields.
+import { useTerminal } from "./data";
 import { Chip, Metric, Pill, type Tone } from "./ui";
 import { fmtAge } from "@/lib/format";
 import { usePolling } from "@/lib/hooks";
@@ -39,7 +40,12 @@ type Jobs = {
 const STATE_TONE: Record<Capability["state"], Tone> = { qualified: "ok", degraded: "warn", unsupported: "idle" };
 const sec = (ms: number | null) => (ms === null ? "–" : ms >= 60_000 ? `${(ms / 60_000).toFixed(1)}m` : `${(ms / 1000).toFixed(0)}s`);
 
+type Strategy = { setup: string; label: string; sleeve: string; state: "supported" | "unsupported"; reason: string; contract: { entryTtlMs: number; maxTapeAgeMs: number | null } };
+type Sleeves = { sleeves: { sleeve: string; cashSol: number; reservedSol: number }[]; unallocatedSol: number } | null;
+
 export default function SystemTab() {
+  const { portfolio } = useTerminal();
+  const { data: strategies } = usePolling<Strategy[]>("/api/agent/strategies", 30_000);
   const { data: h } = usePolling<Health>("/api/agent/health", 5_000);
   const { data: caps } = usePolling<Capability[]>("/api/agent/capabilities", 15_000);
   const { data: jobs } = usePolling<Jobs>("/api/agent/jobs", 15_000);
@@ -67,6 +73,36 @@ export default function SystemTab() {
           <Metric label="Recovered markets" value={h.recovery.restoredMints} tone={h.recovery.missingMints.length ? "warn" : undefined} hint={h.recovery.missingMints.join(", ")} />
         </div>
         <p className="text-[11px] leading-snug text-zinc-500">Execution model: {h.executionModel}</p>
+        <div>
+          <div className="label mb-1">Sleeves (funded partitions of one account)</div>
+          {(["agent", "rules"] as const).map((id) => {
+            const sl = (portfolio?.accounts.find((a) => a.id === id) as unknown as { sleeves?: Sleeves })?.sleeves;
+            if (!sl) return null;
+            return (
+              <div key={id} className="mb-1 flex flex-wrap items-center gap-1.5 text-xs">
+                <span className="w-12 text-zinc-300">{id}</span>
+                {sl.sleeves.map((x) => (
+                  <Chip key={x.sleeve} label={x.sleeve} value={`${x.cashSol.toFixed(3)}◎${x.reservedSol ? ` (${x.reservedSol.toFixed(3)} reserved)` : ""}`} tone={x.cashSol > 0 ? undefined : "idle"} />
+                ))}
+                <Chip label="unallocated" value={`${sl.unallocatedSol.toFixed(3)}◎`} />
+              </div>
+            );
+          })}
+        </div>
+        {strategies && (
+          <div>
+            <div className="label mb-1">Strategy readiness</div>
+            {strategies.map((st) => (
+              <div key={st.setup} className="mb-1 flex flex-wrap items-center gap-1.5 text-xs">
+                <Pill tone={st.state === "supported" ? "ok" : "idle"}>{st.state}</Pill>
+                <span className="text-zinc-200">{st.label}</span>
+                <Chip label="sleeve" value={st.sleeve} />
+                <Chip label="TTL" value={`${Math.round(st.contract.entryTtlMs / 1000)}s`} />
+                <span className="w-full pl-1 text-zinc-500">{st.reason}</span>
+              </div>
+            ))}
+          </div>
+        )}
         {jobs && (
           <div>
             <div className="label mb-1">Research jobs (24h)</div>

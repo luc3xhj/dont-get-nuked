@@ -1,7 +1,7 @@
 // The registered migrations, applied once each (in order, after a verified backup) at worker start.
 import { CONFIG } from "./config";
 import { db } from "./db";
-import { hasOpening, post, toLamports } from "./ledger";
+import { ensureSleeveColumn, hasOpening, post, toLamports } from "./ledger";
 import { addColumn, type Migration } from "./migrations";
 import { RISK } from "./portfolio";
 
@@ -56,5 +56,11 @@ export const MIGRATIONS: Migration[] = [
     name: "trade_received_at",
     // When each trade reached the worker (its availability), separately from the chain time `ts`.
     up: () => addColumn("trades", "received_at", "INTEGER"),
+  },
+  {
+    version: 4,
+    name: "ledger_sleeve",
+    // Funded-sleeve attribution for cash movements (null = unallocated capital and legacy events).
+    up: () => ensureSleeveColumn(),
   },
 ];

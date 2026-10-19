@@ -16,10 +16,10 @@ const SHORTCUTS: [string, string][] = [
   ["W", "Show / hide watchlist"],
   ["L", "Show / hide live feed"],
   ["D", "Show / hide dock"],
-  ["1–9", "Dock tabs"],
+  ["1–9, 0", "Dock tabs (0 = System)"],
   ["?", "This help"],
 ];
-const DOCK_KEYS: DockTab[] = ["positions", "trades", "decisions", "research", "traders", "performance", "evidence", "dataset", "system"];
+const DOCK_KEYS: DockTab[] = ["positions", "trades", "decisions", "research", "traders", "discovery", "learning", "performance", "evidence"];
 const FOLLOWED = new Set(["buy", "sell", "win", "loss", "setup", "analyst", "trader"]);
 
 function Shell() {
@@ -88,6 +88,7 @@ function Shell() {
       else if (k === "?") setHelp((h) => !h);
       else if (k === "escape") setHelp(false);
       else if (/^[1-9]$/.test(k)) update({ dock: true, dockTab: DOCK_KEYS[Number(k) - 1] });
+      else if (k === "0") update({ dock: true, dockTab: "system" });
       else return;
       e.preventDefault();
     };

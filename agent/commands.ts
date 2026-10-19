@@ -10,11 +10,14 @@ import {
   requestExit,
   requestFlatten,
   resetRiskAnchors,
+  reallocate,
   resumeEntries,
+  SLEEVES,
   type ControlResult,
 } from "./portfolio";
+import type { SleeveId } from "./setups";
 
-export const COMMAND_TYPES = ["pause_entries", "resume_entries", "cancel_pending_buys", "request_exit", "request_flatten", "reset_risk_anchors"] as const;
+export const COMMAND_TYPES = ["pause_entries", "resume_entries", "cancel_pending_buys", "request_exit", "request_flatten", "reset_risk_anchors", "reallocate_cash"] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
 db.exec(`
@@ -84,6 +87,15 @@ export function executeCommand(input: Record<string, unknown>): CommandResponse 
     case "reset_risk_anchors":
       r = resetRiskAnchors();
       break;
+    case "reallocate_cash": {
+      const sleeve = (v: unknown) => (v === null || v === undefined || v === "unallocated" ? null : (SLEEVES as string[]).includes(String(v)) ? (v as SleeveId) : undefined);
+      const from = sleeve(payload.from);
+      const to = sleeve(payload.to);
+      if (from === undefined || to === undefined || !(Number(payload.amountSol) > 0))
+        return { httpStatus: 422, body: { error: "payload needs from, to (sleeve or 'unallocated') and amountSol > 0", reasonCodes: ["invalid_payload"] } };
+      r = reallocate((payload.account as "agent" | "rules") ?? "agent", from, to, Number(payload.amountSol));
+      break;
+    }
   }
   const revision = stateRevision() + (r.status === "applied" ? 1 : 0);
   const result = { reasonCodes: r.reasonCodes, detail: r.detail };
