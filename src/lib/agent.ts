@@ -173,6 +173,9 @@ export type Account = {
   positions: number;
   equity: number;
   unpriced: number;
+  /** False when a position can't be reliably priced: equity is then only the priced part (not a loss). */
+  complete?: boolean;
+  reserved?: number;
   startCash: number;
   paused: string | null;
   cooldownUntil: number;
@@ -201,6 +204,10 @@ export type OpenPosition = {
   heldMin: number;
   evidence: string[];
   analystAtEntry: string;
+  exiting?: boolean;
+  /** Frozen initial risk (approved_plan_v2); R = net PnL ÷ R0. */
+  r0Sol?: number;
+  feesSol?: number;
 };
 export type ClosedTrade = {
   id: string;

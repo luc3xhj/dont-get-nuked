@@ -39,6 +39,8 @@ export type Trade = {
   sol: number;
   tokens: number;
   priceSol: number;
+  /** When the worker received this trade (its availability for decisions), distinct from chain time `ts`. */
+  receivedAt?: number;
   program: string;
 };
 

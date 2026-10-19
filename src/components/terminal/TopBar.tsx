@@ -1,8 +1,10 @@
 "use client";
 
+import { useState } from "react";
 import { useTerminal } from "./data";
 import type { Layout } from "./layout";
 import { pctSigned, solSigned } from "@/lib/agent";
+import { describeResult, sendCommand } from "@/lib/commands";
 import { fmtCompact, pnlColor } from "@/lib/format";
 
 function Chip({ tone, label, value, title }: { tone: "ok" | "warn" | "bad" | "info" | "idle"; label: string; value: string; title?: string }) {
@@ -40,7 +42,12 @@ export default function TopBar({ layout, update, onHelp }: { layout: Layout; upd
   const regime = state?.regime;
   const analyst = state?.analyst;
   const treg = state?.treg;
-  const control = (action: "pause" | "resume") => fetch(`/api/agent/control?action=${action}`, { method: "POST" });
+  const [notice, setNotice] = useState<string | null>(null);
+  const control = async (action: "pause" | "resume") => {
+    const r = await sendCommand(action === "pause" ? "pause_entries" : "resume_entries");
+    setNotice(describeResult(r));
+  };
+  const incomplete = agent?.complete === false;
 
   return (
     <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-panel px-3 py-2">
@@ -54,8 +61,13 @@ export default function TopBar({ layout, update, onHelp }: { layout: Layout; upd
         <div>
           <div className="label">Agent wallet</div>
           <div className="num text-[15px] font-semibold text-white">
-            {agent ? `${agent.equity.toFixed(3)} SOL` : "…"}
+            {agent ? `${incomplete ? "≥ " : ""}${agent.equity.toFixed(3)} SOL` : "…"}
             {agent && solUsd > 0 && <span className="ml-1.5 text-xs font-normal text-zinc-500">{fmtCompact(agent.equity * solUsd)}</span>}
+            {incomplete && (
+              <span className="ml-1.5 text-[10px] font-normal text-amber-300" title={`${agent?.unpriced} position(s) without a reliable price: shown equity covers the priced part only`}>
+                valuation incomplete
+              </span>
+            )}
           </div>
         </div>
         {agent && (
@@ -120,6 +132,11 @@ export default function TopBar({ layout, update, onHelp }: { layout: Layout; upd
           ?
         </button>
         <span className="mx-1 h-4 w-px bg-line" />
+        {notice && (
+          <button onClick={() => setNotice(null)} className="max-w-xs truncate text-[11px] text-amber-300" title={notice}>
+            {notice} ✕
+          </button>
+        )}
         {agent?.paused ? (
           <button onClick={() => control("resume")} className="rounded-md bg-emerald-500 px-2.5 py-1 text-[11px] font-semibold text-black hover:bg-emerald-400">
             Resume
