@@ -54,6 +54,11 @@ export type DecisionSnapshot = {
   pool: Pool | null;
   exec: ExecAssumptions;
   risk: RiskParams;
+  /**
+   * When each input became available to the worker (all ≤ `at`). A decision may only use evidence that had
+   * arrived by its decision time; these record exactly what that was.
+   */
+  evidenceTimes?: Record<string, number | null>;
 };
 
 /**

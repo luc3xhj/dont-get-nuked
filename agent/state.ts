@@ -1,7 +1,7 @@
 // In-memory market state: the coin universe, which coins are "hot" (deep-watched),
 // and each hot coin's trade tape, holder and social reports.
 import { CONFIG } from "./config";
-import { db, journal, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
+import { db, journal, loadCoin, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
 import { budget } from "./http";
 import { wilsonLower } from "./stats";
 import { devReport, dsQuotes, GT_URL, gtTrades, holderReport, pumpList, socialReport, tradePage } from "./sources";
@@ -95,6 +95,21 @@ export function restore() {
   for (const c of loadCoins(Date.now() - CONFIG.universe.maxAgeMs)) stateFor(c);
 }
 
+/**
+ * Restores coins the portfolio still depends on (open positions, pending orders) regardless of age or
+ * discovery status, with their saved reports. Returns mints whose coin record couldn't be found.
+ */
+export function ensureCoins(mints: Iterable<string>): string[] {
+  const missing: string[] = [];
+  for (const mint of mints) {
+    if (coins.has(mint)) continue;
+    const c = loadCoin(mint);
+    if (c) stateFor(c);
+    else missing.push(mint);
+  }
+  return missing;
+}
+
 // ---------- universe ----------
 
 export type Lane = "new" | "stretch" | "migrated";
@@ -128,9 +143,9 @@ function attention(c: Coin, now: number): number {
   // Size helps (strongest predictor in research) up to the pool's sweet spot, then stops mattering.
   s += Math.log10(Math.max(1, Math.min(c.mcapUsd, sweet) / 1000)) * 2;
   if (c.mcapUsd < floor) s -= 4;
-  if (c.socials.telegram) s += 2; // ~9x graduation lift in Kamat 2026
-  if (c.socials.twitter) s += 1;
-  if (c.socials.website) s += 0.5;
+  // Social links are a weak, unproven signal (the Kamat collector-label result was retracted in its
+  // revised version), so they only add a small, equal nudge; Pulse filters decide eligibility.
+  s += 0.5 * [c.socials.telegram, c.socials.twitter, c.socials.website].filter(Boolean).length;
   s += Math.min(2, Math.log10(1 + c.replies));
   return s;
 }
@@ -235,6 +250,33 @@ function liveScore(s: CoinState) {
 
 // ---------- tape ----------
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS coverage_intervals (
+    mint TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    covered_from INTEGER,
+    covered_to INTEGER,
+    from_launch INTEGER NOT NULL,
+    gaps INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (mint, kind)
+  ) WITHOUT ROWID;
+`);
+const upsertCoverage = db.prepare(
+  "INSERT OR REPLACE INTO coverage_intervals (mint, kind, covered_from, covered_to, from_launch, gaps, updated_at) VALUES (?, 'tape', ?, ?, ?, ?, ?)",
+);
+/**
+ * The trade tape we hold for a coin: from the first to the last trade, whether it reaches launch, and how
+ * many polls may have missed trades. A gap is never closed by a later page without verified overlap.
+ */
+export function tapeCoverage(s: CoinState) {
+  return { coveredFrom: s.trades[0]?.ts ?? null, coveredTo: s.trades.at(-1)?.ts ?? null, fromLaunch: s.fromLaunch, gaps: s.tapeGaps };
+}
+const saveCoverage = (s: CoinState) => {
+  const c = tapeCoverage(s);
+  upsertCoverage.run(s.coin.mint, c.coveredFrom, c.coveredTo, c.fromLaunch ? 1 : 0, c.gaps, Date.now());
+};
+
 /** Called with each batch of newly seen trades (e.g. watched-trader alerts). */
 export const tradeListeners: ((s: CoinState, fresh: Trade[]) => void)[] = [];
 const notifyTrades = (s: CoinState, fresh: Trade[]) => {
@@ -257,7 +299,8 @@ async function backfill(s: CoinState) {
     let cursor: string | null = null;
     for (let pages = 0; ; pages++) {
       const page = await tradePage(s.coin.mint, cursor);
-      const fresh = page.trades.filter((t) => addTrade(s, t));
+      const receivedAt = Date.now();
+      const fresh = page.trades.map((t) => ({ ...t, receivedAt })).filter((t) => addTrade(s, t));
       saveTrades(fresh);
       notifyTrades(s, fresh);
       stats.tradesIngested += fresh.length;
@@ -279,12 +322,15 @@ const wantsBackfill = (s: CoinState) => !s.backfilled && s.coin.stage === "curve
 /** Live tape poll: GeckoTerminal's last 300 trades (its own rate limit, deeper than pump.fun's 100). */
 async function pollTape(s: CoinState) {
   stats.tapePolls++;
-  const page = await gtTrades(s.coin.mint, pairAddress(s.coin));
+  const receivedAt = Date.now();
+  // Held positions' tapes are protective work and jump the queue.
+  const page = (await gtTrades(s.coin.mint, pairAddress(s.coin), pinned.has(s.coin.mint) ? 0 : 1)).map((t) => ({ ...t, receivedAt }));
   // A full page that shares nothing with what we hold means trades in between were missed.
   if (s.trades.length && page.length >= 250 && !page.some((t) => s.ids.has(t.tx))) s.tapeGaps++;
   const fresh = page.filter((t) => addTrade(s, t));
   saveTrades(fresh);
   notifyTrades(s, fresh);
+  saveCoverage(s);
   stats.tradesIngested += fresh.length;
   const last = s.trades.at(-1);
   if (last) s.coin.lastTradeAt = Math.max(s.coin.lastTradeAt, last.ts);
