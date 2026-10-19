@@ -16,10 +16,12 @@ const SHORTCUTS: [string, string][] = [
   ["W", "Show / hide watchlist"],
   ["L", "Show / hide live feed"],
   ["D", "Show / hide dock"],
-  ["1–8", "Dock tabs"],
+  ["1–9, 0", "Dock tabs (0 = System)"],
   ["?", "This help"],
 ];
-const DOCK_KEYS: DockTab[] = ["positions", "trades", "decisions", "research", "traders", "performance", "evidence", "dataset"];
+const DOCK_KEYS: DockTab[] = ["positions", "trades", "decisions", "research", "traders", "discovery", "learning", "performance", "evidence"];
+/** Every tab can be deep-linked with ?dock=…, including those without a number key. */
+const ALL_TABS: DockTab[] = [...DOCK_KEYS, "dataset", "system"];
 const FOLLOWED = new Set(["buy", "sell", "win", "loss", "setup", "analyst", "trader"]);
 
 function Shell() {
@@ -42,7 +44,7 @@ function Shell() {
   // Deep links from the old pages: ?dock=research etc.
   useEffect(() => {
     const dock = params.get("dock") as DockTab | null;
-    if (dock && DOCK_KEYS.includes(dock)) update({ dock: true, dockTab: dock });
+    if (dock && ALL_TABS.includes(dock)) update({ dock: true, dockTab: dock });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -87,7 +89,8 @@ function Shell() {
       else if (k === "d") update({ dock: !layout.dock });
       else if (k === "?") setHelp((h) => !h);
       else if (k === "escape") setHelp(false);
-      else if (/^[1-8]$/.test(k)) update({ dock: true, dockTab: DOCK_KEYS[Number(k) - 1] });
+      else if (/^[1-9]$/.test(k)) update({ dock: true, dockTab: DOCK_KEYS[Number(k) - 1] });
+      else if (k === "0") update({ dock: true, dockTab: "system" });
       else return;
       e.preventDefault();
     };

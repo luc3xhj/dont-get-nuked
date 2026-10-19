@@ -1,7 +1,7 @@
 // In-memory market state: the coin universe, which coins are "hot" (deep-watched),
 // and each hot coin's trade tape, holder and social reports.
 import { CONFIG } from "./config";
-import { db, journal, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
+import { db, journal, loadCoin, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
 import { budget } from "./http";
 import { wilsonLower } from "./stats";
 import { devReport, dsQuotes, GT_URL, gtTrades, holderReport, pumpList, socialReport, tradePage } from "./sources";
@@ -24,6 +24,8 @@ export type CoinState = {
   backfilled: boolean;
   /** Polls whose page had no overlap with the tape we held (trades may be missing). */
   tapeGaps: number;
+  /** When the live tape was last successfully polled (fast strategies require it to be recent). */
+  lastPolledAt?: number;
   nextPollAt: number;
   holders: HolderReport | null;
   social: SocialReport | null;
@@ -42,6 +44,23 @@ export type CoinState = {
 };
 
 export const coins = new Map<string, CoinState>();
+/**
+ * Extra attention requested by discovery (evidence or wallet leads), by mint: { boost, at }. It only
+ * raises observation priority among coins that already pass their filters; it never admits a coin.
+ */
+export const candidateBoost = new Map<string, number>();
+const boostAt = new Map<string, number>();
+export const boostOf = (mint: string, now = Date.now()) => {
+  const at = boostAt.get(mint);
+  if (!candidateBoost.has(mint)) return 0;
+  if (at === undefined) boostAt.set(mint, now);
+  else if (now - at > 30 * 60_000) {
+    candidateBoost.delete(mint);
+    boostAt.delete(mint);
+    return 0;
+  }
+  return candidateBoost.get(mint) ?? 0;
+};
 /** When we saw a tracked coin graduate (curve → PumpSwap), for the regime filter. Observed transitions only. */
 export const graduations: number[] = [];
 /** Mints that must stay deep-watched (open positions), set by the portfolio. */
@@ -83,16 +102,56 @@ function stateFor(coin: Coin): CoinState {
     s.coin = {
       ...coin,
       firstSeen: s.coin.firstSeen,
-      // Keep what we learned about migration; list data doesn't carry it.
-      migratedAt: s.coin.migratedAt ?? (migratedNow ? Date.now() : null),
-      migratedAtSource: s.coin.migratedAtSource ?? (migratedNow ? "observed" : null),
+      // Keep what we learned about lifecycle; list data doesn't carry it.
+      migratedAt: s.coin.migratedAt ?? coin.migratedAt ?? (migratedNow ? Date.now() : null),
+      migratedAtSource: s.coin.migratedAtSource ?? coin.migratedAtSource ?? (migratedNow ? "observed" : null),
+      launchObservedAt: s.coin.launchObservedAt ?? coin.launchObservedAt ?? null,
     };
   }
   return s;
 }
 
+/** A coin seen first on a real-time stream (merged with list data later; lifecycle facts are kept). */
+export function ingestStreamCoin(coin: Coin): CoinState {
+  const s = stateFor(coin);
+  saveCoin(s.coin);
+  return s;
+}
+
+/** Records a migration observed on a real-time stream (receipt time; the stream gives no event time). */
+export function recordStreamMigration(mint: string, receivedAt: number, pool: string | null) {
+  const s = coins.get(mint);
+  if (!s) return false;
+  if (s.coin.stage === "curve" && Date.now() - stats.startedAt > 120_000) graduations.push(receivedAt);
+  s.coin = {
+    ...s.coin,
+    stage: "migrated",
+    pool: pool ?? s.coin.pool,
+    // A pool-creation time from the chain is better than our receipt time; keep it if we have it.
+    migratedAt: s.coin.migratedAtSource === "pool_created" ? s.coin.migratedAt : receivedAt,
+    migratedAtSource: s.coin.migratedAtSource === "pool_created" ? "pool_created" : "migration_stream",
+  };
+  saveCoin(s.coin);
+  return true;
+}
+
 export function restore() {
   for (const c of loadCoins(Date.now() - CONFIG.universe.maxAgeMs)) stateFor(c);
+}
+
+/**
+ * Restores coins the portfolio still depends on (open positions, pending orders) regardless of age or
+ * discovery status, with their saved reports. Returns mints whose coin record couldn't be found.
+ */
+export function ensureCoins(mints: Iterable<string>): string[] {
+  const missing: string[] = [];
+  for (const mint of mints) {
+    if (coins.has(mint)) continue;
+    const c = loadCoin(mint);
+    if (c) stateFor(c);
+    else missing.push(mint);
+  }
+  return missing;
 }
 
 // ---------- universe ----------
@@ -128,9 +187,9 @@ function attention(c: Coin, now: number): number {
   // Size helps (strongest predictor in research) up to the pool's sweet spot, then stops mattering.
   s += Math.log10(Math.max(1, Math.min(c.mcapUsd, sweet) / 1000)) * 2;
   if (c.mcapUsd < floor) s -= 4;
-  if (c.socials.telegram) s += 2; // ~9x graduation lift in Kamat 2026
-  if (c.socials.twitter) s += 1;
-  if (c.socials.website) s += 0.5;
+  // Social links are a weak, unproven signal (the Kamat collector-label result was retracted in its
+  // revised version), so they only add a small, equal nudge; Pulse filters decide eligibility.
+  s += 0.5 * [c.socials.telegram, c.socials.twitter, c.socials.website].filter(Boolean).length;
   s += Math.min(2, Math.log10(1 + c.replies));
   return s;
 }
@@ -184,7 +243,7 @@ function selectHot(now: number) {
   );
   const hot = new Set(keep);
   // Coins that pass every filter first, then those still being checked; attention breaks ties.
-  const rank = (s: CoinState) => (s.pulse?.status === "pass" ? 100 : 0) + liveScore(s);
+  const rank = (s: CoinState) => (s.pulse?.status === "pass" ? 100 : 0) + boostOf(s.coin.mint, now) + liveScore(s);
   const ranked = all.filter((s) => !hot.has(s) && eligible(s) && s.score > -Infinity).sort((a, b) => rank(b) - rank(a));
   // Fill each pool's share of slots first, then any leftover slots with the best of the rest.
   for (const [lane, slots] of Object.entries(CONFIG.universe.laneSlots) as [Lane, number][]) {
@@ -235,6 +294,33 @@ function liveScore(s: CoinState) {
 
 // ---------- tape ----------
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS coverage_intervals (
+    mint TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    covered_from INTEGER,
+    covered_to INTEGER,
+    from_launch INTEGER NOT NULL,
+    gaps INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (mint, kind)
+  ) WITHOUT ROWID;
+`);
+const upsertCoverage = db.prepare(
+  "INSERT OR REPLACE INTO coverage_intervals (mint, kind, covered_from, covered_to, from_launch, gaps, updated_at) VALUES (?, 'tape', ?, ?, ?, ?, ?)",
+);
+/**
+ * The trade tape we hold for a coin: from the first to the last trade, whether it reaches launch, and how
+ * many polls may have missed trades. A gap is never closed by a later page without verified overlap.
+ */
+export function tapeCoverage(s: CoinState) {
+  return { coveredFrom: s.trades[0]?.ts ?? null, coveredTo: s.trades.at(-1)?.ts ?? null, fromLaunch: s.fromLaunch, gaps: s.tapeGaps };
+}
+const saveCoverage = (s: CoinState) => {
+  const c = tapeCoverage(s);
+  upsertCoverage.run(s.coin.mint, c.coveredFrom, c.coveredTo, c.fromLaunch ? 1 : 0, c.gaps, Date.now());
+};
+
 /** Called with each batch of newly seen trades (e.g. watched-trader alerts). */
 export const tradeListeners: ((s: CoinState, fresh: Trade[]) => void)[] = [];
 const notifyTrades = (s: CoinState, fresh: Trade[]) => {
@@ -257,7 +343,8 @@ async function backfill(s: CoinState) {
     let cursor: string | null = null;
     for (let pages = 0; ; pages++) {
       const page = await tradePage(s.coin.mint, cursor);
-      const fresh = page.trades.filter((t) => addTrade(s, t));
+      const receivedAt = Date.now();
+      const fresh = page.trades.map((t) => ({ ...t, receivedAt })).filter((t) => addTrade(s, t));
       saveTrades(fresh);
       notifyTrades(s, fresh);
       stats.tradesIngested += fresh.length;
@@ -279,12 +366,16 @@ const wantsBackfill = (s: CoinState) => !s.backfilled && s.coin.stage === "curve
 /** Live tape poll: GeckoTerminal's last 300 trades (its own rate limit, deeper than pump.fun's 100). */
 async function pollTape(s: CoinState) {
   stats.tapePolls++;
-  const page = await gtTrades(s.coin.mint, pairAddress(s.coin));
+  const receivedAt = Date.now();
+  // Held positions' tapes are protective work and jump the queue.
+  const page = (await gtTrades(s.coin.mint, pairAddress(s.coin), pinned.has(s.coin.mint) ? 0 : 1)).map((t) => ({ ...t, receivedAt }));
   // A full page that shares nothing with what we hold means trades in between were missed.
   if (s.trades.length && page.length >= 250 && !page.some((t) => s.ids.has(t.tx))) s.tapeGaps++;
   const fresh = page.filter((t) => addTrade(s, t));
   saveTrades(fresh);
   notifyTrades(s, fresh);
+  s.lastPolledAt = receivedAt;
+  saveCoverage(s);
   stats.tradesIngested += fresh.length;
   const last = s.trades.at(-1);
   if (last) s.coin.lastTradeAt = Math.max(s.coin.lastTradeAt, last.ts);

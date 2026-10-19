@@ -5,7 +5,7 @@ import TokenIcon from "./TokenIcon";
 import { coinImage, pctSigned, SETUP_LABEL, solSigned, type ClosedTrade, type OpenPosition } from "@/lib/agent";
 import { fmtAge, pnlColor } from "@/lib/format";
 
-export function OpenPositions({ positions }: { positions: OpenPosition[] }) {
+export function OpenPositions({ positions, onExit }: { positions: OpenPosition[]; onExit?: (p: OpenPosition) => void }) {
   if (!positions.length)
     return (
       <div className="px-4 py-8 text-center text-sm text-zinc-500">
@@ -23,6 +23,7 @@ export function OpenPositions({ positions }: { positions: OpenPosition[] }) {
             <th className="px-3 py-2 font-medium">P&amp;L</th>
             <th className="px-3 py-2 font-medium">Plan</th>
             <th className="px-3 py-2 font-medium">Held</th>
+            {onExit && <th className="px-3 py-2" />}
           </tr>
         </thead>
         <tbody>
@@ -45,6 +46,7 @@ export function OpenPositions({ positions }: { positions: OpenPosition[] }) {
                 <td className="num px-3 py-2 text-xs text-zinc-400">
                   <div>
                     stop {pctSigned(p.stopSol / p.entryPriceSol - 1)}
+                    {p.r0Sol ? <span className="ml-1 text-zinc-500">· R0 {p.r0Sol.toFixed(4)}◎</span> : null}
                     {p.tp1Done && <span className="ml-1 text-emerald-400">trailing</span>}
                   </div>
                   <div>
@@ -54,6 +56,17 @@ export function OpenPositions({ positions }: { positions: OpenPosition[] }) {
                 <td className="num px-3 py-2 text-xs text-zinc-500">
                   {p.heldMin.toFixed(1)}m / {p.plan.maxHoldMin}m
                 </td>
+                {onExit && (
+                  <td className="px-3 py-2 text-right">
+                    {p.exiting ? (
+                      <span className="text-[11px] text-amber-300">exit pending</span>
+                    ) : (
+                      <button onClick={() => onExit(p)} className="rounded border border-line-2 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-rose-500 hover:text-rose-200">
+                        Exit
+                      </button>
+                    )}
+                  </td>
+                )}
               </tr>
             );
           })}

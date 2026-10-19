@@ -1,8 +1,18 @@
-// Small fetch wrapper: timeouts, per-host concurrency, 429 backoff and call stats.
+// Small fetch wrapper: timeouts, per-host concurrency, 429 backoff, call stats, and priority classes so
+// protective work (held positions, execution quotes) is served before enrichment, discovery and research.
+
+/**
+ * 0 protective (held positions, exits) · 1 execution (quotes, live tapes of candidates) · 2 default ·
+ * 3 enrichment (holders, funding, backfill) · 4 discovery and research.
+ */
+export type Priority = 0 | 1 | 2 | 3 | 4;
+type Waiter = { resolve: () => void; priority: Priority; seq: number; enqueuedAt: number };
 
 type HostState = {
   active: number;
-  queue: (() => void)[];
+  queue: Waiter[];
+  /** Recent queue waits (ms) per priority, for health reporting. */
+  waits: Map<Priority, number[]>;
   limit: number;
   pausedUntil: number;
   ok: number;
@@ -36,7 +46,7 @@ function host(url: string, limit: number): HostState {
   let s = hosts.get(h);
   if (!s) {
     const perMin = RATE_PER_MIN[h] ?? 60;
-    s = { active: 0, queue: [], limit, pausedUntil: 0, ok: 0, errors: 0, lastError: null, perMin, tokens: perMin / 4, refilledAt: Date.now() };
+    s = { active: 0, queue: [], waits: new Map(), limit, pausedUntil: 0, ok: 0, errors: 0, lastError: null, perMin, tokens: perMin / 4, refilledAt: Date.now() };
     hosts.set(h, s);
   }
   return s;
@@ -67,18 +77,37 @@ async function takeToken(s: HostState) {
   }
 }
 
-async function acquire(s: HostState) {
-  if (s.active < s.limit) {
+let seq = 0;
+async function acquire(s: HostState, priority: Priority) {
+  const enqueuedAt = Date.now();
+  if (s.active < s.limit && !s.queue.length) {
     s.active++;
+    recordWait(s, priority, 0);
     return;
   }
-  await new Promise<void>((resolve) => s.queue.push(resolve));
+  await new Promise<void>((resolve) => s.queue.push({ resolve, priority, seq: seq++, enqueuedAt }));
   s.active++;
+  recordWait(s, priority, Date.now() - enqueuedAt);
 }
 
+function recordWait(s: HostState, p: Priority, ms: number) {
+  const w = s.waits.get(p) ?? [];
+  w.push(ms);
+  if (w.length > 200) w.shift();
+  s.waits.set(p, w);
+}
+
+/** Next waiter: highest priority (lowest number) first, then arrival order. */
 function release(s: HostState) {
   s.active--;
-  s.queue.shift()?.();
+  if (!s.queue.length) return;
+  let best = 0;
+  for (let i = 1; i < s.queue.length; i++) {
+    const a = s.queue[i];
+    const b = s.queue[best];
+    if (a.priority < b.priority || (a.priority === b.priority && a.seq < b.seq)) best = i;
+  }
+  s.queue.splice(best, 1)[0].resolve();
 }
 
 export class HttpError extends Error {
@@ -92,10 +121,10 @@ export class HttpError extends Error {
 
 export async function getJson<T = unknown>(
   url: string,
-  opts: { limit?: number; timeoutMs?: number; headers?: Record<string, string> } = {},
+  opts: { limit?: number; timeoutMs?: number; headers?: Record<string, string>; priority?: Priority } = {},
 ): Promise<T> {
   const s = host(url, opts.limit ?? 4);
-  await acquire(s);
+  await acquire(s, opts.priority ?? 2);
   try {
     await takeToken(s);
     const res = await fetch(url, {
@@ -120,9 +149,9 @@ export async function getJson<T = unknown>(
 }
 
 /** JSON-RPC call under the same per-host budget, concurrency and 429 handling as getJson. */
-export async function rpc<T = unknown>(url: string, method: string, params: unknown[], opts: { timeoutMs?: number } = {}): Promise<T> {
+export async function rpc<T = unknown>(url: string, method: string, params: unknown[], opts: { timeoutMs?: number; priority?: Priority } = {}): Promise<T> {
   const s = host(url, 2);
-  await acquire(s);
+  await acquire(s, opts.priority ?? 3);
   try {
     await takeToken(s);
     const res = await fetch(url, {
@@ -158,6 +187,15 @@ export function httpStats() {
         pausedForMs: Math.max(0, s.pausedUntil - Date.now()),
         perMin: s.perMin,
         lastError: s.lastError,
+        oldestQueuedMs: s.queue.length ? Date.now() - Math.min(...s.queue.map((w) => w.enqueuedAt)) : 0,
+        queuedByPriority: s.queue.reduce<Record<number, number>>((m, w) => ((m[w.priority] = (m[w.priority] ?? 0) + 1), m), {}),
+        // p95 queue wait per priority over the recent window.
+        waitP95Ms: Object.fromEntries(
+          [...s.waits].map(([p, w]) => {
+            const sorted = [...w].sort((x, y) => x - y);
+            return [p, sorted[Math.floor(sorted.length * 0.95)] ?? 0];
+          }),
+        ),
       },
     ]),
   );

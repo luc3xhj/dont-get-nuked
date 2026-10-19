@@ -5,7 +5,7 @@
 import { createServer } from "node:http";
 import { activity, agentFills, storedCoin } from "./activity";
 import { CONFIG } from "./config";
-import { journal, prune } from "./db";
+import { db, journal, prune } from "./db";
 import { computeFeatures } from "./features";
 import { httpStats } from "./http";
 import { runScreens, verdict } from "./screens";
@@ -16,12 +16,35 @@ import { walletsTick } from "./wallets";
 import { evidenceReport } from "./evidence";
 import { tregHealth } from "./research";
 import { researchReport } from "./research-report";
-import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio, walletSummary } from "./portfolio";
+import {
+  cancelPendingBuys,
+  control,
+  followerOnTrades,
+  heldMints,
+  obligationMints,
+  onSignals,
+  portfolioReport,
+  portfolioTick,
+  reconciliationReport,
+  restorePortfolio,
+  walletSummary,
+} from "./portfolio";
+import { commandStatus, executeCommand, stateRevision } from "./commands";
+import { appliedVersions, runMigrations } from "./migrations";
+import { MIGRATIONS } from "./schema";
+import { capabilityReport } from "./capabilities";
+import { jobsReport, recoverJobs } from "./jobs";
+import { discoveryReport, discoveryTick } from "./discovery";
+import { addLesson, learningReport, seedRegistry } from "./learning";
+import { enqueue } from "./jobs";
+import { cohortVersions, walletEpisodes } from "./traders";
+import { startLifecycleStream, stopLifecycleStream } from "./streams";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { restoreEpisodes, trackEpisodes } from "./episodes";
-import { evaluateSetups } from "./setups";
+import { CONTRACTS, evaluateSetups, HORIZON_REQUIREMENTS, SETUP_LABEL, SETUP_SLEEVE, setReadinessUniverse, strategyReadiness } from "./setups";
 import { funnelReport, markVersionStart } from "./funnel";
 import { COLUMNS, evaluatePulse, pulseReport, pulseTick, setFilters, type ColumnId } from "./pulse";
-import { discoverTraders, onTrades, tradersOnCoin, tradersReport, unwatchWallet, watchWallet } from "./traders";
+import { discoverTraders, isTracked, onTrades, tradersOnCoin, tradersReport, unwatchWallet, watchWallet } from "./traders";
 import {
   coins,
   devHistory,
@@ -33,6 +56,8 @@ import {
   reportsTick,
   restore,
   stats,
+  ensureCoins,
+  tapeCoverage,
   tapeTick,
   tradeListeners,
   type CoinState,
@@ -57,7 +82,8 @@ function evaluate(s: CoinState) {
   captureHot(s);
   // Only fires from a live episode count; an expired or invalidated one cools down first.
   const fired = trackEpisodes(s.coin.mint, s.setups);
-  if (fired.length) onSignals(s, fired);
+  // New entries only while the worker is healthy (not recovering, faulted or draining).
+  if (fired.length && workerState === "running") onSignals(s, fired);
 }
 
 function loop(name: string, everyMs: number, fn: () => Promise<void>) {
@@ -142,9 +168,47 @@ const server = createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/control") {
     const action = url.searchParams.get("action");
     if (action !== "pause" && action !== "resume") return send(res, 400, { error: "action must be pause or resume" });
-    control(action);
-    return send(res, 200, { ok: true });
+    const r = control(action);
+    return send(res, 200, { ok: r.status === "applied", ...r });
   }
+  if (url.pathname === "/api/commands" && req.method === "POST") {
+    readJson(req)
+      .then((body) => {
+        if (workerState !== "running") return send(res, 409, { error: `Worker is ${workerState}`, reasonCodes: ["worker_not_running"] });
+        const r = executeCommand(body);
+        return send(res, r.httpStatus, r.body);
+      })
+      .catch((e) => send(res, 400, { error: e instanceof Error ? e.message : "Bad request" }));
+    return;
+  }
+  const cm = url.pathname.match(/^\/api\/commands\/([A-Za-z0-9_-]{1,100})$/);
+  if (cm) {
+    const c = commandStatus(cm[1]);
+    return c ? send(res, 200, c) : send(res, 404, { error: "Unknown command" });
+  }
+  if (url.pathname === "/api/health") return send(res, 200, health());
+  if (url.pathname === "/api/capabilities") return send(res, 200, capabilityReport());
+  if (url.pathname === "/api/jobs") return send(res, 200, jobsReport());
+  if (url.pathname === "/api/discovery") return send(res, 200, discoveryReport());
+  if (url.pathname === "/api/strategies")
+    return send(
+      res,
+      200,
+      strategyReadiness().map((r) => ({ ...r, label: SETUP_LABEL[r.setup], contract: CONTRACTS[r.setup], horizon: HORIZON_REQUIREMENTS[r.setup as keyof typeof HORIZON_REQUIREMENTS] ?? null, sleeveOf: SETUP_SLEEVE[r.setup] })),
+    );
+  if (url.pathname === "/api/learning" && req.method === "GET") return send(res, 200, { ...learningReport(), cohorts: cohortVersions() });
+  if (url.pathname === "/api/learning/lessons" && req.method === "POST") {
+    readJson(req)
+      .then((body) => {
+        const r = addLesson(body);
+        return send(res, "error" in r ? 400 : 200, r);
+      })
+      .catch((e) => send(res, 400, { error: e instanceof Error ? e.message : "Bad request" }));
+    return;
+  }
+  const wm = url.pathname.match(/^\/api\/wallets\/([1-9A-HJ-NP-Za-km-z]{32,44})\/episodes$/);
+  if (wm) return send(res, 200, { address: wm[1], episodes: walletEpisodes(wm[1]).slice(0, 100) });
+  if (url.pathname === "/api/reconciliation") return send(res, 200, reconciliationReport());
   if (url.pathname === "/api/traders") {
     if (req.method === "GET") return send(res, 200, tradersReport());
     if (req.method === "POST") {
@@ -238,6 +302,7 @@ const server = createServer((req, res) => {
         recentTrades: s.trades.slice(-60).reverse(),
         fills,
         traders: tradersOnCoin(s),
+        coverage: tapeCoverage(s),
       });
     // No longer watched: still show what we know and what the agent did.
     const c = storedCoin(mint);
@@ -256,17 +321,71 @@ const server = createServer((req, res) => {
   send(res, 404, { error: "not found" });
 });
 
+// ---------- health ----------
+
+/** recovering → running → draining → stopped; faulted if startup integrity fails. */
+let workerState: "recovering" | "running" | "draining" | "stopped" | "faulted" = "recovering";
+const recovery: { migrations: number[]; backup: string | null; restoredMints: number; missingMints: string[]; error?: string } = {
+  migrations: [],
+  backup: null,
+  restoredMints: 0,
+  missingMints: [],
+};
+const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+loopDelay.enable();
+
+function health() {
+  const r = reconciliationReport();
+  return {
+    workerState,
+    heartbeatAt: Date.now(),
+    startedAt: stats.startedAt,
+    stateRevision: stateRevision(),
+    schemaVersions: appliedVersions(),
+    recovery,
+    reconciliation: { ok: r.ok, issues: r.issues },
+    eventLoopDelayMs: { p50: loopDelay.percentile(50) / 1e6, p99: loopDelay.percentile(99) / 1e6, max: loopDelay.max / 1e6 },
+    hosts: httpStats(),
+    executionModel: "core_approximate_v1 (local AMM estimate; fill modeled atomically at the first fresh quote after latency)",
+  };
+}
+
 // ---------- start ----------
 
+try {
+  const m = runMigrations(MIGRATIONS);
+  recovery.migrations = m.applied;
+  recovery.backup = m.backup;
+  if (m.applied.length) journal("migrations", null, m);
+} catch (e) {
+  // Financial mutations stay blocked; diagnostics remain readable.
+  workerState = "faulted";
+  recovery.error = e instanceof Error ? e.message : String(e);
+  console.error("[migrations]", recovery.error);
+}
 restore();
 restorePortfolio();
 restoreEpisodes();
+recoverJobs();
+setReadinessUniverse(() => [...coins.values()].filter((s) => s.hot));
+seedRegistry();
 markVersionStart();
+// Every market the portfolio depends on is restored regardless of age or discovery status.
+{
+  const need = obligationMints();
+  recovery.missingMints = ensureCoins(need);
+  recovery.restoredMints = need.size - recovery.missingMints.length;
+  journal("recovery", null, { obligations: need.size, missing: recovery.missingMints });
+}
 for (const m of heldMints()) pinned.add(m);
+if (workerState === "recovering") workerState = reconciliationReport().ok ? "running" : "faulted";
+if (workerState === "faulted") console.error("[recovery] worker faulted:", recovery.error ?? reconciliationReport().issues.join("; "));
 server.listen(CONFIG.port, "127.0.0.1", () => console.log(`agent API on http://127.0.0.1:${CONFIG.port}`));
 journal("start", null, { config: CONFIG });
 
 loop("universe", CONFIG.universe.refreshMs, refreshUniverse);
+// Real-time launches and migrations (free PumpPortal subscriptions only).
+if (process.env.LIFECYCLE_STREAM !== "off") startLifecycleStream();
 loop("tape", 1_000, () => tapeTick(evaluate));
 loop("reports", 5_000, reportsTick);
 loop("quotes", 2_000, quoteTick);
@@ -276,7 +395,16 @@ loop("wallets", 5_000, walletsTick);
 loop("dataset-sample", 20_000, sampleTick);
 loop("dataset-label", 60_000, labelTick);
 tradeListeners.push(onTrades);
+// Follower experiment: reacts only while the worker is healthy; protective exits run regardless.
+tradeListeners.push((s, fresh) => {
+  if (workerState === "running") followerOnTrades(s, fresh, isTracked);
+});
 loop("pulse", 3_000, () => pulseTick());
+loop("discovery", 30_000, () => discoveryTick());
+// Scheduled experiment review (deterministic; shares the job queue so it is recorded like other work).
+loop("reviews", 6 * 3600_000, async () => {
+  enqueue("experiment_review", "all", 3, Date.now() + 3600_000);
+});
 loop("traders", 10 * 60_000, async () => {
   const n = discoverTraders();
   console.log(`[traders] ${n} discovered wallets ranked`);
@@ -286,18 +414,31 @@ loop("evaluate", 1_000, async () => {
   for (const s of coins.values()) if (s.hot) evaluate(s);
 });
 loop("portfolio", 1_000, async () => {
+  // A faulted worker (schema or reconciliation failure) makes no financial changes.
+  if (workerState !== "running") return;
   portfolioTick();
   pinned.clear();
   for (const m of heldMints()) pinned.add(m);
 });
 loop("prune", 10 * 60_000, async () => {
-  prune(new Set([...coins.values()].filter((s) => s.hot).map((s) => s.coin.mint)), 24 * 3600_000);
+  // Retention classes: obligations forever; evidence/wallet candidates 7 days (longer horizons need
+  // history); everything else 24 hours. Closed-trade coins keep their coin record (see db.prune).
+  const keep = [...coins.values()].filter((s) => s.hot).map((s) => s.coin.mint).concat([...obligationMints()]);
+  const longer = (db.prepare("SELECT mint FROM candidates WHERE mint IS NOT NULL AND (ingress LIKE '%evidence%' OR ingress LIKE '%wallet%')").all() as { mint: string }[]).map((r) => r.mint);
+  prune(new Set([...keep, ...longer]), 24 * 3600_000);
+  prune(new Set(keep), 7 * 24 * 3600_000);
 });
 
 // launchd sends SIGTERM on stop; Ctrl-C sends SIGINT.
 for (const sig of ["SIGINT", "SIGTERM"] as const)
   process.on(sig, () => {
-    journal("stop", null, { signal: sig });
+    // Drain: no new admissions; unsubmitted buys are cancelled (their reservations released). Open
+    // positions and their exit obligations are persisted and restored on the next start.
+    workerState = "draining";
+    const cancelled = (["agent", "shadow", "baseline"] as const).reduce((n, id) => n + cancelPendingBuys(id, "Worker stopping"), 0);
+    journal("stop", null, { signal: sig, cancelledBuys: cancelled, openPositions: heldMints().size });
+    workerState = "stopped";
+    stopLifecycleStream();
     server.close();
     process.exit(0);
   });

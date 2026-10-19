@@ -13,7 +13,8 @@ export function compareAnalysis(input: {
   withoutAnalysisReasons?: string[];
 }): { actual: DecisionOutcome; impact: AnalysisImpact } {
   const { analysis, now, sizeFor, minimum } = input;
-  const fresh = analysis && analysis.expiresAt > now ? analysis : null;
+  // A report counts only between becoming available and expiring (never before it existed).
+  const fresh = analysis && analysis.expiresAt > now && (analysis.availableAt ?? analysis.at) <= now ? analysis : null;
   const outcome = (scale: number, reject: boolean, extra: string[] = []): DecisionOutcome => {
     const sizeSol = sizeFor(scale);
     const reasons = [...input.commonReasons, ...extra];

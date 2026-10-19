@@ -166,13 +166,16 @@ export type Stats = {
   expectancySol: number;
   bestShare: number | null;
 };
-export type AccountId = "agent" | "shadow" | "baseline";
+export type AccountId = "agent" | "rules" | "shadow" | "baseline" | "follower";
 export type Account = {
   id: AccountId;
   cash: number;
   positions: number;
   equity: number;
   unpriced: number;
+  /** False when a position can't be reliably priced: equity is then only the priced part (not a loss). */
+  complete?: boolean;
+  reserved?: number;
   startCash: number;
   paused: string | null;
   cooldownUntil: number;
@@ -201,6 +204,10 @@ export type OpenPosition = {
   heldMin: number;
   evidence: string[];
   analystAtEntry: string;
+  exiting?: boolean;
+  /** Frozen initial risk (approved_plan_v2); R = net PnL ÷ R0. */
+  r0Sol?: number;
+  feesSol?: number;
 };
 export type ClosedTrade = {
   id: string;
@@ -259,6 +266,11 @@ export type ActivityItem = {
 };
 
 export const SETUP_LABEL: Record<string, string> = {
+  early_momentum: "Fast · early momentum",
+  first_shallow_pullback: "Fast · first shallow pullback",
+  migration_event: "Fast · migration response",
+  breakout_continuation: "Fast · breakout continuation",
+  wallet_follow: "Experiment · follow tracked wallet",
   new_dump: "New pair · first dump",
   stretch_deep: "Final Stretch · deep selloff",
   stretch_pullback: "Final Stretch · pullback",

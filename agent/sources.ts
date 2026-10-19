@@ -1,6 +1,6 @@
 // Free data sources. Everything external is untrusted data: parsed defensively, never executed.
 import { CONFIG } from "./config";
-import { getJson } from "./http";
+import { getJson, type Priority } from "./http";
 import { wilsonLower } from "./stats";
 import type { Coin, DevReport, HolderReport, PairMarket, Quote, SocialReport, Trade } from "./types";
 
@@ -240,7 +240,7 @@ export async function dsQuotes(addresses: string[]): Promise<Record<string, Quot
   if (!addresses.length) return {};
   const json = await getJson<{ pairs?: Record<string, unknown>[] | null }>(
     `https://api.dexscreener.com/latest/dex/pairs/solana/${addresses.slice(0, 30).join(",")}`,
-    { limit: 2 },
+    { limit: 2, priority: 1 },
   );
   const out: Record<string, Quote> = {};
   for (const p of json.pairs ?? []) {
@@ -265,7 +265,7 @@ export async function dsMarket(pairs: string[]): Promise<Record<string, PairMark
   if (!pairs.length) return {};
   const json = await getJson<{ pairs?: Record<string, unknown>[] | null }>(
     `https://api.dexscreener.com/latest/dex/pairs/solana/${pairs.slice(0, 30).join(",")}`,
-    { limit: 2 },
+    { limit: 2, priority: 4 },
   );
   const out: Record<string, PairMarket> = {};
   type Window = { m5?: number; h1?: number; h24?: number };
@@ -306,8 +306,8 @@ type GtTrade = {
 };
 
 /** Last 300 trades of a pool (curve or PumpSwap) from GeckoTerminal; no paging. */
-export async function gtTrades(mint: string, pool: string): Promise<Trade[]> {
-  const json = await getJson<{ data?: GtTrade[] }>(`${GT}/pools/${pool}/trades`, { limit: 2 });
+export async function gtTrades(mint: string, pool: string, priority: Priority = 1): Promise<Trade[]> {
+  const json = await getJson<{ data?: GtTrade[] }>(`${GT}/pools/${pool}/trades`, { limit: 2, priority });
   const out: Trade[] = [];
   for (const d of json.data ?? []) {
     const a = d.attributes;

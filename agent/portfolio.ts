@@ -6,16 +6,36 @@
 import { NETWORK_FEE_SOL } from "../src/lib/amm";
 import { CONFIG } from "./config";
 import { db, journal } from "./db";
-import { decideFrom, POST_TP1_STOP, TP1_FRACTION, type DecisionResult, type DecisionSnapshot } from "./decision";
-import { EXEC, fillBuy, fillSell, latency, liquidationValue, poolOf } from "./execution";
+import { costModel, decideFrom, POST_TP1_STOP, TP1_FRACTION, type DecisionResult, type DecisionSnapshot } from "./decision";
+import {
+  allocate,
+  cashLamports,
+  ensureSleeveColumn,
+  hasAllocations,
+  hasOpening,
+  positionNetLamports,
+  post,
+  resetLedgerCache,
+  sleeveCashLamports,
+  toLamports,
+  toSol,
+} from "./ledger";
+import { EXEC, fillBuy, fillSell, latency, liquidationValue, poolOf, seededRandom } from "./execution";
 import { essentialsFor } from "./requirements";
-import { SETUP_LABEL, type Plan, type SetupEval, type SetupId } from "./setups";
+import { barsFor } from "./bars";
+import { CONTRACTS, SETUP_LABEL, SETUP_SLEEVE, type Plan, type SetupEval, type SetupId, type SleeveId } from "./setups";
+import type { Trade } from "./types";
 import type { Analysis } from "./analyst";
 import { regime } from "./regime";
 import { coins, type CoinState } from "./state";
 import { analysisKey } from "./analysis-impact";
 
-export type AccountId = "agent" | "shadow" | "baseline";
+/**
+ * agent: the strategy with research · rules: the same policy on the same opportunities with research removed
+ * (measures research's net contribution) · shadow: every fired setup at a fixed size · baseline: random coins.
+ * Each is a separately funded paper account with its own opening credit.
+ */
+export type AccountId = "agent" | "rules" | "shadow" | "baseline" | "follower";
 
 export const RISK = {
   startCash: 10,
@@ -87,6 +107,24 @@ export type Position = {
   creator?: string;
   /** Strategy version that opened the position. */
   version?: string;
+  /**
+   * Initial risk R0 (approved_plan_v2): the modeled net loss at the original structural stop for the approved
+   * size, frozen before submission. Strictly positive and never changed afterwards; R = net PnL ÷ R0.
+   */
+  r0Sol?: number;
+  riskDefinitionVersion?: "approved_plan_v2" | "legacy_v1";
+  /** Fees of failed exit attempts on this position (they are part of its net PnL). */
+  feesSol?: number;
+  /** Follower experiment: the tracked wallet whose observed buy triggered this lot. */
+  leader?: string;
+  /** Funded sleeve (immutable) and the sleeve currently managing the lot (management transfer is disabled). */
+  sleeveId?: SleeveId;
+  managementSleeveId?: SleeveId;
+  /** Failed attempts of the current exit intent, the next allowed retry, and degradation once exhausted. */
+  exitFailures?: number;
+  exitRetryAt?: number;
+  exitIntent?: string;
+  exitDegradedAt?: number | null;
 };
 
 export type Closed = {
@@ -110,6 +148,11 @@ export type Closed = {
   entryDecisionId?: string;
   exitAnalysisId?: string | null;
   version?: string;
+  r0Sol?: number;
+  feesSol?: number;
+  riskDefinitionVersion?: "approved_plan_v2" | "legacy_v1";
+  /** False when the legacy risk denominator was not positive (the cash result stands; R is unusable). */
+  rValid?: boolean;
 };
 
 type Order = {
@@ -138,6 +181,15 @@ type Order = {
   waitingSince?: number;
   /** A TP1 sell: the position only counts TP1 as done (and moves its stop) once this fills. */
   kind?: "tp1";
+  /** Cash held back for a pending buy (amount + network fee); released when the order ends. */
+  reserveSol?: number;
+  /** Frozen planned risk for the lot this buy would open. */
+  r0Sol?: number;
+  /** The order can't be submitted at or after this time (entry orders: the signal's validity). */
+  submitBy?: number;
+  /** Follower experiment: the tracked wallet whose buy triggered this order. */
+  leader?: string;
+  sleeve?: SleeveId;
 };
 
 // ---------- persistence ----------
@@ -151,10 +203,12 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY, at INTEGER NOT NULL, mint TEXT NOT NULL, version TEXT NOT NULL, snapshot TEXT NOT NULL, result TEXT NOT NULL);
   CREATE INDEX IF NOT EXISTS decisions_at ON decisions (at);
+  -- The rules-only comparator's decision on the same opportunity (opportunity_id = the agent decision id).
+  CREATE TABLE IF NOT EXISTS comparator_decisions (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL, account TEXT NOT NULL, at INTEGER NOT NULL, snapshot TEXT NOT NULL, result TEXT NOT NULL);
 `);
 
 const dayKey = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
-const IDS: AccountId[] = ["agent", "shadow", "baseline"];
+const IDS: AccountId[] = ["agent", "rules", "shadow", "baseline", "follower"];
 
 const accounts = new Map<AccountId, Account>();
 const positions = new Map<string, Position>();
@@ -195,6 +249,7 @@ export function restorePortfolio() {
     const a = JSON.parse(row.data) as Account;
     accounts.set(a.id, a);
   }
+  resetLedgerCache();
   for (const id of IDS)
     if (!accounts.has(id)) {
       const a: Account = {
@@ -207,9 +262,16 @@ export function restorePortfolio() {
         cooldownUntil: 0,
         paused: null,
       };
+      atomically(() => {
+        // Exactly one opening credit per account; cash is always the sum of the account's ledger events.
+        if (!hasOpening(id)) post({ account: id, type: "opening_capital", cashLamports: toLamports(RISK.startCash), payload: { startCash: RISK.startCash } });
+        saveAccount(a);
+      });
       accounts.set(id, a);
-      saveAccount(a);
     }
+  // Cash is a projection of the ledger.
+  for (const a of accounts.values()) if (hasOpening(a.id)) a.cash = toSol(cashLamports(a.id));
+  for (const id of IDS) initSleeves(id);
   // Orders survive restarts: buys past their timeout expire on the next tick, sells keep waiting for a price.
   orders.length = 0;
   for (const row of db.prepare("SELECT data FROM orders").all() as { data: string }[]) orders.push(JSON.parse(row.data) as Order);
@@ -222,14 +284,83 @@ export function restorePortfolio() {
 
 /** Mints with open positions stay deep-watched. */
 export const heldMints = () => new Set([...positions.values()].map((p) => p.mint));
+/** Mints the portfolio depends on: open positions and pending orders (never pruned, always recovered). */
+export const obligationMints = () => new Set([...heldMints(), ...orders.map((o) => o.mint)]);
 
 // ---------- equity & risk ----------
 
+/** A mark older than this doesn't count as a reliable valuation. */
+const VALUATION_MAX_AGE_MS = 60_000;
+
+/** Quantity-specific net exit value now, or null when it can't be reliably valued (never zero by default). */
 function positionValue(p: Position): number | null {
   const s = coins.get(p.mint);
-  return s ? liquidationValue(s, p.tokens) : null;
+  if (!s?.quote || Date.now() - s.quote.at > VALUATION_MAX_AGE_MS) return null;
+  return liquidationValue(s, p.tokens);
 }
 
+/** Cash held back for this account's pending buys. */
+export const reservedOf = (id: AccountId) => orders.filter((o) => o.account === id && o.side === "buy").reduce((t, o) => t + (o.reserveSol ?? 0), 0);
+export const spendableOf = (id: AccountId) => accounts.get(id)!.cash - reservedOf(id);
+
+// ---------- sleeves ----------
+
+/** Accounts whose capital is partitioned by holding horizon (the strategy and its comparator, identically). */
+const SLEEVED = new Set<AccountId>(["agent", "rules"]);
+/**
+ * Initial allocation (a configuration, not optimized weights): fast 60%, intraday 30%, 10% unallocated
+ * reserve. Swing and position stay unfunded until their data contracts qualify; reallocation is an
+ * explicit, zero-sum command.
+ */
+export const SLEEVE_PLAN: Record<SleeveId, number> = { fast: 0.6, intraday: 0.3, swing: 0, position: 0 };
+export const SLEEVES: SleeveId[] = ["fast", "intraday", "swing", "position"];
+
+const sleeveReserved = (id: AccountId, sleeve: SleeveId) =>
+  orders.filter((o) => o.account === id && o.side === "buy" && (o.sleeve ?? "fast") === sleeve).reduce((t, o) => t + (o.reserveSol ?? 0), 0);
+export function sleeveSpendable(id: AccountId, sleeve: SleeveId) {
+  if (!SLEEVED.has(id)) return spendableOf(id);
+  return toSol(sleeveCashLamports(id, sleeve)) - sleeveReserved(id, sleeve);
+}
+export function sleevesOf(id: AccountId) {
+  if (!SLEEVED.has(id)) return null;
+  const a = accounts.get(id)!;
+  const rows = SLEEVES.map((sl) => ({ sleeve: sl, cashSol: toSol(sleeveCashLamports(id, sl)), reservedSol: sleeveReserved(id, sl) }));
+  const allocated = rows.reduce((t, r) => t + r.cashSol, 0);
+  return { sleeves: rows, unallocatedSol: a.cash - allocated };
+}
+
+/** First run with sleeves: allocate the plan from current cash (one time, journaled). */
+function initSleeves(id: AccountId) {
+  if (!SLEEVED.has(id) || hasAllocations(id)) return;
+  ensureSleeveColumn();
+  const cash = toLamports(accounts.get(id)!.cash);
+  atomically(() => {
+    for (const sl of SLEEVES) {
+      const amt = Math.floor(cash * SLEEVE_PLAN[sl]);
+      if (amt > 0) allocate(id, null, sl, amt, "initial sleeve plan");
+    }
+    journal("sleeve_allocation", null, { account: id, plan: SLEEVE_PLAN, cashSol: toSol(cash) });
+  });
+}
+
+/** Moves unreserved cash between unallocated capital (null) and sleeves; never between accounts. */
+export function reallocate(id: AccountId, from: SleeveId | null, to: SleeveId | null, amountSol: number): ControlResult {
+  if (!SLEEVED.has(id)) return { status: "blocked", reasonCodes: ["account_not_sleeved"], detail: {} };
+  if (from === to || !(amountSol > 0)) return { status: "blocked", reasonCodes: ["invalid_allocation"], detail: {} };
+  const view = sleevesOf(id)!;
+  const available = from === null ? view.unallocatedSol - (reservedOf(id) - SLEEVES.reduce((t, sl) => t + sleeveReserved(id, sl), 0)) : sleeveSpendable(id, from);
+  if (available + 1e-12 < amountSol) return { status: "blocked", reasonCodes: ["insufficient_unreserved_cash"], detail: { availableSol: available } };
+  atomically(() => {
+    allocate(id, from, to, toLamports(amountSol), "operator reallocation");
+    journal("sleeve_allocation", null, { account: id, from, to, amountSol });
+  });
+  return { status: "applied", reasonCodes: [], detail: { from, to, amountSol } };
+}
+
+/**
+ * Account equity. When any position can't be reliably valued, `complete` is false and `equity` is only
+ * the priced part: it is not a loss, and it never moves the risk anchors (peak, daily baseline).
+ */
 export function equityOf(id: AccountId) {
   const a = accounts.get(id)!;
   let value = 0;
@@ -240,20 +371,40 @@ export function equityOf(id: AccountId) {
     if (v === null) unpriced++;
     else value += v;
   }
-  return { cash: a.cash, positions: value, equity: a.cash + value, unpriced };
+  return { cash: a.cash, reserved: reservedOf(id), positions: value, equity: a.cash + value, unpriced, complete: unpriced === 0 };
 }
 
-function riskGate(a: Account): string | null {
-  const now = Date.now();
-  const { equity } = equityOf(a.id);
+/** Updates the account's risk anchors from a reliable valuation; called on every tick, independent of signals. */
+function updateRiskState(a: Account) {
+  const { equity, complete } = equityOf(a.id);
+  // Without a complete valuation the anchors stay as they are (a deferred day baseline keeps yesterday's guard).
+  if (!complete) return;
   if (a.dayKey !== dayKey()) {
     a.dayKey = dayKey();
     a.dayStartEquity = equity;
     if (a.paused?.startsWith("Daily")) a.paused = null;
     saveAccount(a);
   }
-  a.peakEquity = Math.max(a.peakEquity, equity);
+  if (equity > a.peakEquity) {
+    a.peakEquity = equity;
+    saveAccount(a);
+  }
+}
+
+/** Current drawdown from the reliably observed peak (0–1), or null without a complete valuation. */
+export function drawdownOf(id: AccountId) {
+  const a = accounts.get(id)!;
+  const { equity, complete } = equityOf(id);
+  return complete && a.peakEquity > 0 ? Math.max(0, 1 - equity / a.peakEquity) : null;
+}
+
+function riskGate(a: Account): string | null {
+  const now = Date.now();
+  updateRiskState(a);
+  const { equity, complete, unpriced } = equityOf(a.id);
   if (a.paused) return a.paused;
+  // Unknown valuation blocks new risk (exits continue); it is never treated as a loss.
+  if (!complete) return `Valuation incomplete: ${unpriced} position${unpriced > 1 ? "s" : ""} without a reliable price`;
   if (equity <= a.peakEquity * (1 - RISK.maxDrawdown)) {
     a.paused = `Max drawdown ${(RISK.maxDrawdown * 100).toFixed(0)}% hit — paused until reset`;
     journal("risk_pause", null, { account: a.id, reason: a.paused, equity });
@@ -300,13 +451,51 @@ const uid = () => crypto.randomUUID();
 const openFor = (account: AccountId, mint: string) => [...positions.values()].some((p) => p.account === account && p.mint === mint);
 const pendingFor = (account: AccountId, mint: string) => orders.some((o) => o.account === account && o.mint === mint);
 
-const newDraws = () => ({ latency: Math.random(), fail: Math.random() });
+/**
+ * Execution randomness is reproducible from the order id alone (independent of the statistics' random
+ * stream, so viewing reports can never change a fill). Tests may inject a source.
+ */
+let drawSource = (orderId: string) => {
+  const r = seededRandom(`exec:${orderId}`);
+  return { latency: r(), fail: r() };
+};
+export const setDrawSource = (fn: typeof drawSource) => {
+  drawSource = fn;
+};
 
-function placeBuy(account: AccountId, s: CoinState, solIn: number, setup: SetupId | "random", plan: Plan, evidence: string[], reason: string, decision?: Decision) {
+const EXEC_ASSUMPTIONS = () => ({ adverseSlippage: EXEC.adverseSlippage, networkFeeSol: NETWORK_FEE_SOL, maxImpact: RISK.maxImpact, stopGap: RISK.stopGap });
+
+/** Places a paper buy, or records why it can't: no pool, no positive planned risk, or not enough spendable cash. */
+function placeBuy(
+  account: AccountId,
+  s: CoinState,
+  solIn: number,
+  setup: SetupId | "random",
+  plan: Plan,
+  evidence: string[],
+  reason: string,
+  decision?: Decision,
+): boolean {
   const now = Date.now();
-  const draws = newDraws();
+  const reject = (code: string, detail: Record<string, unknown> = {}) => {
+    journal("order_rejected", s.coin.mint, { account, setup, solIn, code, decisionId: decision?.id, ...detail });
+    return false;
+  };
+  const pool = poolOf(s);
+  if (!pool) return reject("no_executable_pool");
+  // approved_plan_v2: freeze strictly positive planned risk for this exact size before submission.
+  const r0Sol = -costModel(pool, plan, solIn, EXEC_ASSUMPTIONS()).stopNetSol;
+  if (!(r0Sol > 0) || !(plan.stopSol < plan.entrySol)) return reject("non_positive_planned_risk", { r0Sol });
+  const reserveSol = solIn + NETWORK_FEE_SOL;
+  if (spendableOf(account) < reserveSol) return reject("insufficient_funds", { spendable: spendableOf(account), required: reserveSol });
+  // A sleeve can't borrow another sleeve's idle cash.
+  const sleeve: SleeveId = setup === "random" ? "fast" : (SETUP_SLEEVE[setup] ?? "fast");
+  if (SLEEVED.has(account) && sleeveSpendable(account, sleeve) < reserveSol)
+    return reject("sleeve_insufficient_funds", { sleeve, spendable: sleeveSpendable(account, sleeve), required: reserveSol });
+  const id = uid();
+  const draws = drawSource(id);
   const o: Order = {
-    id: uid(),
+    id,
     decisionId: decision?.id,
     analysisId: decision?.impact.analysisId,
     analystVerdict: decision?.analyst.verdict,
@@ -323,9 +512,29 @@ function placeBuy(account: AccountId, s: CoinState, solIn: number, setup: SetupI
     reason,
     version: CONFIG.strategyVersion,
     draws,
+    reserveSol,
+    r0Sol,
+    sleeve: SLEEVED.has(account) ? sleeve : undefined,
+    // The entry can't be submitted after its signal expires (each strategy declares its own TTL).
+    submitBy: now + (plan.entryTtlMs ?? EXEC.orderTimeoutMs),
   };
   addOrder(o);
-  journal("order", s.coin.mint, { id: o.id, decisionId: o.decisionId, analysisId: o.analysisId, account, side: "buy", solIn, setup, plan, reason, version: o.version });
+  journal("order", s.coin.mint, {
+    id: o.id,
+    decisionId: o.decisionId,
+    analysisId: o.analysisId,
+    account,
+    side: "buy",
+    solIn,
+    setup,
+    plan,
+    reason,
+    version: o.version,
+    r0Sol,
+    reserveSol,
+    submitBy: o.submitBy,
+  });
+  return true;
 }
 
 export type Decision = { id: string; version: string } & DecisionResult;
@@ -335,11 +544,11 @@ const creatorOf = (mint: string) => coins.get(mint)?.coin.creator;
 const snapshotAnalysis = (a: Analysis | null): Analysis | null => (a ? { ...a, research: undefined } : null);
 
 /** Everything the agent's decision depends on, frozen at decision time (replayable with decideFrom). */
-export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now()): DecisionSnapshot {
-  const a = accounts.get("agent")!;
-  const { equity } = equityOf("agent");
-  const agentPositions = [...positions.values()].filter((x) => x.account === "agent");
-  const agentBuys = orders.filter((o) => o.account === "agent" && o.side === "buy");
+export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now(), accountId: "agent" | "rules" = "agent"): DecisionSnapshot {
+  const a = accounts.get(accountId)!;
+  const { equity } = equityOf(accountId);
+  const agentPositions = [...positions.values()].filter((x) => x.account === accountId);
+  const agentBuys = orders.filter((o) => o.account === accountId && o.side === "buy");
   const creator = s.coin.creator;
   const sameCreatorOpen =
     agentPositions.filter((p) => p.mint !== s.coin.mint && (p.creator ?? creatorOf(p.mint)) === creator).length +
@@ -359,14 +568,25 @@ export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now()): De
     evidence: evd,
     account: {
       equity,
-      cash: a.cash,
+      cash: sleeveSpendable(accountId, SETUP_SLEEVE[ev.setup] ?? "fast"),
       open: agentPositions.length + agentBuys.length,
       gate: riskGate(a),
-      busy: openFor("agent", s.coin.mint) || pendingFor("agent", s.coin.mint),
-      reentry: now - (lastExit.get(`agent:${s.coin.mint}`) ?? 0) < RISK.reentryCooldownMs,
+      busy: openFor(accountId, s.coin.mint) || pendingFor(accountId, s.coin.mint),
+      reentry: now - (lastExit.get(`${accountId}:${s.coin.mint}`) ?? 0) < RISK.reentryCooldownMs,
       sameCreatorOpen: sameCreatorOpen >= RISK.maxPerCreator ? sameCreatorOpen : 0,
     },
     regime: { level: regime.level, reasons: [...regime.reasons] },
+    evidenceTimes: {
+      quoteReceivedAt: s.quote?.at ?? null,
+      lastTradeAt: s.trades.at(-1)?.ts ?? null,
+      lastTradeReceivedAt: s.trades.at(-1)?.receivedAt ?? null,
+      holdersAt: s.holders?.at ?? null,
+      fundingAt: s.funding?.at ?? null,
+      socialAt: s.social?.at ?? null,
+      devAt: s.dev?.at ?? null,
+      analysisAt: s.analysis?.at ?? null,
+      tapeCoveredFrom: s.trades[0]?.ts ?? null,
+    },
     analysis: snapshotAnalysis(s.analysis),
     pool: poolOf(s),
     exec: { adverseSlippage: EXEC.adverseSlippage, networkFeeSol: NETWORK_FEE_SOL, maxImpact: RISK.maxImpact, stopGap: RISK.stopGap },
@@ -431,6 +651,19 @@ export function onSignals(s: CoinState, fired: SetupEval[]) {
       journal("decision", s.coin.mint, { setup: ev.setup, ...d, essentials: snapshot.essentials });
       recentDecisions.unshift({ at: now, mint: s.coin.mint, symbol: s.coin.symbol, setup: ev.setup, ...d, essentials: snapshot.essentials });
       recentDecisions.length = Math.min(recentDecisions.length, 100);
+      // Comparator on the same opportunity: identical policy and snapshot, research removed.
+      if (!openFor("rules", s.coin.mint) && !pendingFor("rules", s.coin.mint)) {
+        const rs = { ...buildSnapshot(s, ev, now, "rules"), analysis: null, essentials: snapshot.essentialsWithoutAnalysis ?? snapshot.essentials };
+        const r = { id: uid(), version: rs.strategyVersion, ...decideFrom(rs) };
+        db.prepare("INSERT INTO comparator_decisions (id, opportunity_id, account, at, snapshot, result) VALUES (?, ?, 'rules', ?, ?, ?)").run(
+          r.id,
+          d.id,
+          now,
+          JSON.stringify(rs),
+          JSON.stringify(r),
+        );
+        if (r.take) placeBuy("rules", s, r.sizeSol, ev.setup, ev.plan, evidence, `${SETUP_LABEL[ev.setup]} · rules only`, r);
+      }
       if (d.take)
         placeBuy(
           "agent",
@@ -447,6 +680,64 @@ export function onSignals(s: CoinState, fired: SetupEval[]) {
 }
 
 export const recentDecisions: ({ at: number; mint: string; symbol: string; setup: SetupId; essentials?: DecisionSnapshot["essentials"] } & Decision)[] = [];
+
+// ---------- follower experiment (wallet_follow_v1) ----------
+
+/**
+ * Registered follower policy, frozen before evaluation. It reacts to an observed buy by a tracked wallet
+ * after that buy becomes available to us, with its own current quote, size and exits; the leader's fill
+ * price is never inherited. These parameters are an experiment configuration, not calibrated values.
+ */
+export const FOLLOW_POLICY = {
+  version: "wallet_follow_v1",
+  minLeaderBuySol: 0.2,
+  /** Ignore observations older than this (our reaction window after receipt). */
+  maxSignalAgeMs: 10_000,
+  /** Skip if the price already ran this far past the leader's fill. */
+  maxDeterioration: 0.1,
+  sizeSol: 0.1,
+  stopPct: 0.15,
+  tp1Pct: 0.3,
+  tp2Pct: 0.6,
+  maxHoldMin: 20,
+};
+
+const followed = new Map<string, number>(); // mint -> last follow decision time
+/** Wallet trades observed on the tape: follow qualifying buys; a leader's sale closes only the follower's own lot. */
+export function followerOnTrades(s: CoinState, fresh: Trade[], isTracked: (wallet: string) => boolean, now = Date.now()) {
+  for (const t of fresh) {
+    if (!isTracked(t.wallet)) continue;
+    const received = t.receivedAt ?? now;
+    if (t.side === "sell") {
+      for (const p of positions.values())
+        if (p.account === "follower" && p.mint === s.coin.mint && p.leader === t.wallet && !p.exiting) placeSell(p, 1, "Leader sold (observed)");
+      continue;
+    }
+    if (t.sol < FOLLOW_POLICY.minLeaderBuySol || now - received > FOLLOW_POLICY.maxSignalAgeMs) continue;
+    if (openFor("follower", s.coin.mint) || pendingFor("follower", s.coin.mint) || now - (followed.get(s.coin.mint) ?? 0) < 10 * 60_000) continue;
+    if (!s.quote || now - s.quote.at > 10_000 || s.pulse?.status === "fail") continue;
+    followed.set(s.coin.mint, now);
+    const entry = s.quote.priceSol;
+    if (entry > t.priceSol * (1 + FOLLOW_POLICY.maxDeterioration)) {
+      journal("order_rejected", s.coin.mint, { account: "follower", code: "price_ran_past_leader", leaderPrice: t.priceSol, price: entry, leader: t.wallet });
+      continue;
+    }
+    const plan: Plan = {
+      entrySol: entry,
+      stopSol: entry * (1 - FOLLOW_POLICY.stopPct),
+      tp1Sol: entry * (1 + FOLLOW_POLICY.tp1Pct),
+      tp2Sol: entry * (1 + FOLLOW_POLICY.tp2Pct),
+      maxHoldMin: FOLLOW_POLICY.maxHoldMin,
+      entryTtlMs: CONTRACTS.wallet_follow.entryTtlMs,
+    };
+    const ok = placeBuy("follower", s, FOLLOW_POLICY.sizeSol, "wallet_follow", plan, [`Leader ${t.wallet.slice(0, 4)}… bought ${t.sol.toFixed(2)}◎`, `Policy ${FOLLOW_POLICY.version}`], "Follow tracked wallet");
+    if (ok) {
+      const o = orders.at(-1)!;
+      o.leader = t.wallet;
+      saveOrder(o);
+    }
+  }
+}
 
 /** Control: same size, timing and plan shape as the shadow entry, on a random other hot coin. */
 function openBaseline(trigger: CoinState, shape: Plan) {
@@ -467,8 +758,14 @@ function openBaseline(trigger: CoinState, shape: Plan) {
 
 function closePosition(p: Position, reason: string) {
   const a = accounts.get(p.account)!;
-  const pnl = p.proceedsSol - p.costSol;
-  const riskSol = p.costSol * ((p.plan.entrySol - p.plan.stopSol) / p.plan.entrySol);
+  const fees = p.feesSol ?? 0;
+  // Net PnL = sell credits − buy debit − fees of failed exit attempts (the same amounts the ledger posted).
+  const pnl = p.proceedsSol - p.costSol - fees;
+  // R uses the frozen, strictly positive R0 (approved_plan_v2). Legacy positions keep their original
+  // definition, and a non-positive legacy denominator makes R unusable instead of flipping its sign.
+  const legacyRisk = p.costSol * ((p.plan.entrySol - p.plan.stopSol) / p.plan.entrySol);
+  const r0 = p.r0Sol && p.r0Sol > 0 ? p.r0Sol : legacyRisk;
+  const rValid = r0 > 0;
   const c: Closed = {
     id: p.id,
     account: p.account,
@@ -481,7 +778,7 @@ function closePosition(p: Position, reason: string) {
     proceedsSol: p.proceedsSol,
     pnlSol: pnl,
     pnlPct: p.costSol ? pnl / p.costSol : 0,
-    r: riskSol ? pnl / riskSol : 0,
+    r: rValid ? pnl / r0 : 0,
     exitReason: reason,
     holdMin: (Date.now() - p.openedAt) / 60_000,
     analystAtEntry: p.analystAtEntry ?? "none",
@@ -489,6 +786,10 @@ function closePosition(p: Position, reason: string) {
     entryDecisionId: p.entryDecisionId,
     exitAnalysisId: p.exitAnalysisId,
     version: p.version,
+    r0Sol: rValid ? r0 : undefined,
+    feesSol: fees,
+    riskDefinitionVersion: p.r0Sol && p.r0Sol > 0 ? "approved_plan_v2" : "legacy_v1",
+    rValid,
   };
   db.prepare("INSERT OR REPLACE INTO closed (id, account, setup, closed_at, data) VALUES (?, ?, ?, ?, ?)").run(
     c.id,
@@ -507,7 +808,23 @@ function closePosition(p: Position, reason: string) {
 }
 
 const drawsOf = (o: Order) => o.draws ?? { latency: 0.5, fail: 1 };
+/** Same freshness rule the fill model uses: a quote that arrived after the order's latency and is still current. */
+const quoteReady = (s: CoinState, o: Order, now: number) => !!s.quote && s.quote.at >= o.notBefore && now - s.quote.at <= EXEC.quoteMaxAgeMs;
 
+/** Ends an order that never reached submission: no fill, no fee, its reservation released. */
+function endUnsubmitted(i: number, kind: "order_expired" | "order_cancelled", reason: string) {
+  const o = orders[i];
+  atomically(() => {
+    removeOrder(i);
+    journal(kind, o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: o.side, reason });
+  });
+}
+
+/**
+ * Core execution profile "core_approximate_v1": a fill is modeled atomically at the first fresh quote after
+ * the order's latency (zero in-flight interval). Everything before that point is pre-submission: deadline,
+ * pause and structural invalidation are rechecked there and end the order with no fill and no fee.
+ */
 function processOrders() {
   const now = Date.now();
   for (let i = orders.length - 1; i >= 0; i--) {
@@ -517,28 +834,35 @@ function processOrders() {
     const expired = now - o.createdAt > EXEC.orderTimeoutMs;
     if (!s) {
       if (o.side === "sell") continue; // a held coin stays tracked; keep the exit until it can be priced
-      atomically(() => {
-        removeOrder(i);
-        journal("order_expired", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: o.side, reason: "Coin no longer tracked" });
-      });
+      endUnsubmitted(i, "order_expired", "Coin no longer tracked");
       continue;
     }
     if (o.side === "buy") {
-      const fill = fillBuy(s, o.solIn!, o.decisionPriceSol, o.notBefore, drawsOf(o).fail);
-      if (fill === "wait") {
-        if (expired)
-          atomically(() => {
-            removeOrder(i);
-            journal("order_expired", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy" });
-          });
+      const submitBy = o.submitBy ?? o.createdAt + EXEC.orderTimeoutMs;
+      if (now >= submitBy) {
+        endUnsubmitted(i, "order_expired", quoteReady(s, o, now) ? "Signal deadline passed before submission" : "No fresh quote before the deadline");
         continue;
       }
+      if (!quoteReady(s, o, now)) continue;
+      // Final pre-submission checks against the quote the order would execute on.
+      if (o.account === "agent" && a.paused) {
+        endUnsubmitted(i, "order_cancelled", `Entries paused: ${a.paused}`);
+        continue;
+      }
+      if (o.plan && s.quote!.priceSol <= o.plan.stopSol) {
+        endUnsubmitted(i, "order_cancelled", "Structure invalidated before submission: price at or below the stop");
+        continue;
+      }
+      const fill = fillBuy(s, o.solIn!, o.decisionPriceSol, o.notBefore, drawsOf(o).fail);
+      if (fill === "wait") continue;
       if (!fill.ok) {
         atomically(() => {
           removeOrder(i);
-          a.cash -= fill.feeSol;
+          // A failed submitted attempt is an opportunity expense (no position exists).
+          if (fill.feeSol > 0)
+            a.cash = post({ account: o.account, type: "attempt_fee", cashLamports: -toLamports(fill.feeSol), mint: o.mint, orderId: o.id, decisionId: o.decisionId ?? null, sleeve: o.sleeve ?? null, payload: { side: "buy", reason: fill.reason } });
           saveAccount(a);
-          journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy", reason: fill.reason });
+          journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy", reason: fill.reason, feeSol: fill.feeSol });
         });
         continue;
       }
@@ -568,14 +892,21 @@ function processOrders() {
         exiting: false,
         creator: s.coin.creator,
         version: o.version,
+        // The lot inherits the risk frozen before submission; later gaps never change it.
+        r0Sol: o.r0Sol,
+        riskDefinitionVersion: o.r0Sol ? "approved_plan_v2" : "legacy_v1",
+        feesSol: 0,
+        leader: o.leader,
+        sleeveId: o.sleeve,
+        managementSleeveId: o.sleeve,
       };
       atomically(() => {
         removeOrder(i);
-        a.cash -= fill.sol;
+        a.cash = post({ account: o.account, type: "buy_fill", cashLamports: -toLamports(fill.sol), mint: o.mint, orderId: o.id, positionId: p.id, decisionId: o.decisionId ?? null, sleeve: o.sleeve ?? null, payload: { tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact } });
         saveAccount(a);
         positions.set(p.id, p);
         savePosition(p);
-        journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "buy", sol: fill.sol, tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact });
+        journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "buy", sol: fill.sol, tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact, r0Sol: o.r0Sol });
       });
     } else {
       const p = positions.get(o.positionId!);
@@ -583,10 +914,11 @@ function processOrders() {
         removeOrder(i);
         continue;
       }
+      // Never sell more than the position still holds.
       const tokensIn = Math.min(o.tokensIn!, p.tokens);
       const fill = fillSell(s, tokensIn, o.notBefore, drawsOf(o).fail);
       if (fill === "wait") {
-        // No fresh price: the position stays open (valued at zero) and the exit keeps waiting. Nothing is invented.
+        // No fresh price: the position stays open (unpriced, not zero) and the exit keeps waiting. Nothing is invented.
         if (expired && !o.waitingSince) {
           o.waitingSince = now;
           saveOrder(o);
@@ -597,19 +929,36 @@ function processOrders() {
       if (!fill.ok) {
         atomically(() => {
           removeOrder(i);
-          a.cash -= fill.feeSol;
-          p.exiting = false; // retry on the next tick
+          // A failed exit's fee belongs to the position's net PnL; inventory and TP state are unchanged.
+          if (fill.feeSol > 0) {
+            a.cash = post({ account: o.account, type: "attempt_fee", cashLamports: -toLamports(fill.feeSol), mint: o.mint, orderId: o.id, positionId: p.id, sleeve: p.sleeveId ?? null, payload: { side: "sell", reason: fill.reason, kind: o.kind ?? null } });
+            p.feesSol = (p.feesSol ?? 0) + fill.feeSol;
+          }
+          p.exiting = false;
+          // Bounded retries: exponential backoff, and no automatic attempt after the budget is spent
+          // (inventory stays visible; a new, different exit intent or an operator request may try again).
+          p.exitFailures = (p.exitFailures ?? 0) + 1;
+          p.exitIntent = o.reason;
+          p.exitRetryAt = now + EXIT_RETRY.baseMs * 2 ** (p.exitFailures - 1);
+          if (p.exitFailures >= EXIT_RETRY.maxFailures) {
+            p.exitDegradedAt = now;
+            journal("exit_degraded", o.mint, { positionId: p.id, account: o.account, intent: o.reason, failures: p.exitFailures });
+          }
           saveAccount(a);
-          journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "sell", reason: fill.reason });
+          savePosition(p);
+          journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "sell", reason: fill.reason, feeSol: fill.feeSol, positionId: p.id });
         });
         continue;
       }
       atomically(() => {
         removeOrder(i);
-        a.cash += fill.sol;
+        a.cash = post({ account: o.account, type: "sell_fill", cashLamports: toLamports(fill.sol), mint: o.mint, orderId: o.id, positionId: p.id, sleeve: p.sleeveId ?? null, payload: { tokens: tokensIn, priceSol: fill.priceSol, reason: o.reason, kind: o.kind ?? null } });
         p.proceedsSol += fill.sol;
         p.tokens -= tokensIn;
         p.exiting = false;
+        p.exitFailures = 0;
+        p.exitRetryAt = undefined;
+        p.exitDegradedAt = null;
         if (o.kind === "tp1") {
           // Only a confirmed TP1 fill locks in: stop to breakeven plus costs, then trail.
           p.tp1Done = true;
@@ -626,6 +975,9 @@ function processOrders() {
   }
 }
 
+/** Exit attempts: 3 chargeable failures per intent, backoff 5s → 10s → 20s; the budget survives restarts. */
+export const EXIT_RETRY = { maxFailures: 3, baseMs: 5_000 };
+
 function placeSell(
   p: Position,
   fraction: number,
@@ -633,12 +985,25 @@ function placeSell(
   analysisId: string | null = null,
   withoutExitReason: string | null = null,
   kind?: Order["kind"],
+  operator = false,
 ) {
   const now = Date.now();
+  const sameIntent = p.exitIntent === reason;
+  if (!operator && sameIntent) {
+    if (p.exitDegradedAt) return; // budget exhausted for this intent: no automatic fourth attempt
+    if (p.exitRetryAt && now < p.exitRetryAt) return; // backing off
+  }
+  if (!sameIntent || operator) {
+    // A new intent (different reason, or an explicit operator request) starts its own attempt budget.
+    p.exitFailures = 0;
+    p.exitDegradedAt = null;
+    p.exitRetryAt = undefined;
+    p.exitIntent = reason;
+  }
   p.exiting = true;
   const decisionId = uid();
   const orderId = uid();
-  const draws = newDraws();
+  const draws = drawSource(orderId);
   addOrder({
     id: orderId,
     decisionId,
@@ -678,7 +1043,14 @@ function manage(p: Position) {
   // TP1 counts as done only when this sell fills (a failed sell is retried on the next tick).
   if (!p.tp1Done && price >= p.plan.tp1Sol) return placeSell(p, TP1_FRACTION, "Take profit 1 (half)", null, null, "tp1");
   if (p.tp1Done) {
-    const trail = p.highSol * (1 - RISK.trailPct);
+    // Horizon lots trail on completed bars (lowest low of the last 3 minus the registered buffer);
+    // fast lots trail a fixed fraction under the high. The stop never loosens.
+    const tr = p.plan.trail;
+    let trail = p.highSol * (1 - RISK.trailPct);
+    if (tr) {
+      const done = barsFor(s, tr.barMs, 5 * tr.barMs).filter((b) => b.state === "ok").slice(-3);
+      trail = done.length === 3 ? Math.min(...done.map((b) => b.low)) - tr.buffer : p.stopSol;
+    }
     if (trail > p.stopSol) {
       p.stopSol = trail;
       savePosition(p);
@@ -706,13 +1078,15 @@ let lastEquityAt = 0;
 export function portfolioTick() {
   processOrders();
   for (const p of [...positions.values()]) manage(p);
+  // Risk anchors (peak, daily baseline) follow every reliable valuation, whether or not a signal arrives.
+  for (const a of accounts.values()) updateRiskState(a);
   const now = Date.now();
   if (now - lastEquityAt >= 60_000) {
     lastEquityAt = now;
     for (const id of IDS) {
       const e = equityOf(id);
-      if (e.unpriced === 0 || id !== "agent")
-        db.prepare("INSERT OR REPLACE INTO equity (account, ts, equity) VALUES (?, ?, ?)").run(id, now, e.equity);
+      // Only complete valuations enter the equity curve: an unpriced position is unknown, not zero.
+      if (e.complete) db.prepare("INSERT OR REPLACE INTO equity (account, ts, equity) VALUES (?, ?, ?)").run(id, now, e.equity);
     }
   }
 }
@@ -772,6 +1146,7 @@ export function portfolioReport() {
     return {
       id,
       ...equityOf(id),
+      sleeves: sleevesOf(id),
       startCash: RISK.startCash,
       paused: a.paused,
       cooldownUntil: a.cooldownUntil,
@@ -816,23 +1191,148 @@ export function walletSummary() {
   return {
     ...e,
     startCash: RISK.startCash,
+    // With an incomplete valuation these are lower bounds over the priced part only (the UI labels them).
     pnlSol: e.equity - RISK.startCash,
     todayPnlSol: e.equity - a.dayStartEquity,
+    drawdown: drawdownOf("agent"),
+    peakEquity: a.peakEquity,
     open: [...positions.values()].filter((p) => p.account === "agent").length,
     paused: a.paused,
     cooldownUntil: a.cooldownUntil,
   };
 }
 
-export function control(action: "pause" | "resume") {
-  const a = accounts.get("agent")!;
-  if (action === "pause") a.paused = "Paused manually";
-  if (action === "resume") {
-    a.paused = null;
-    a.cooldownUntil = 0;
-    a.peakEquity = equityOf("agent").equity;
-    a.dayStartEquity = a.peakEquity;
+// ---------- integrity ----------
+
+/**
+ * Checks the invariants the ledger must hold: cash equals the sum of ledger events (with exactly one
+ * opening credit), pending buys never reserve more than cash, inventory is never negative, and every
+ * ledger-backed position's recorded cost/proceeds/fees match its ledger events.
+ */
+export function reconciliationReport() {
+  const issues: string[] = [];
+  const accountsOut = IDS.map((id) => {
+    const a = accounts.get(id)!;
+    const ledger = cashLamports(id);
+    const projected = toLamports(a.cash);
+    if (!hasOpening(id)) issues.push(`${id}: no opening credit in the ledger`);
+    if (Math.abs(ledger - projected) > 1) issues.push(`${id}: cash ${a.cash} differs from ledger ${toSol(ledger)}`);
+    const reserved = reservedOf(id);
+    if (reserved > a.cash + 1e-9) issues.push(`${id}: pending buys reserve ${reserved.toFixed(4)} but cash is ${a.cash.toFixed(4)}`);
+    return { id, cashSol: a.cash, ledgerCashSol: toSol(ledger), reservedSol: reserved, spendableSol: a.cash - reserved };
+  });
+  for (const id of IDS) {
+    const v = sleevesOf(id);
+    if (!v) continue;
+    for (const sl of v.sleeves) if (sl.cashSol < -1e-9) issues.push(`${id}/${sl.sleeve}: negative sleeve cash ${sl.cashSol}`);
+    if (v.unallocatedSol < -1e-9) issues.push(`${id}: negative unallocated cash ${v.unallocatedSol}`);
   }
+  for (const p of positions.values()) {
+    if (p.tokens < 0) issues.push(`position ${p.id}: negative inventory`);
+    const legNet = toSol(positionNetLamports(p.id));
+    const hasLedgerBuy = !!db.prepare("SELECT 1 FROM ledger_events WHERE position_id = ? AND type = 'buy_fill'").get(p.id);
+    if (hasLedgerBuy && Math.abs(legNet - (p.proceedsSol - p.costSol - (p.feesSol ?? 0))) > 2e-9)
+      issues.push(`position ${p.id}: recorded cash flows differ from the ledger by ${(legNet - (p.proceedsSol - p.costSol - (p.feesSol ?? 0))).toExponential(2)} SOL`);
+  }
+  const dupes = db.prepare("SELECT order_id, type, COUNT(*) AS n FROM ledger_events WHERE order_id IS NOT NULL GROUP BY order_id, type HAVING n > 1").all();
+  if (dupes.length) issues.push(`${dupes.length} orders with duplicate ledger outcomes`);
+  return { ok: issues.length === 0, issues, accounts: accountsOut, openPositions: positions.size, pendingOrders: orders.length };
+}
+
+// ---------- operator controls (called through the idempotent command log) ----------
+
+export type ControlResult = { status: "applied" | "blocked"; reasonCodes: string[]; detail: Record<string, unknown> };
+
+/** Cancels the account's pending buys. In the core model every pending buy is still unsubmitted, so all are cancellable. */
+export function cancelPendingBuys(id: AccountId = "agent", reason = "Cancelled by operator"): number {
+  let n = 0;
+  for (let i = orders.length - 1; i >= 0; i--)
+    if (orders[i].account === id && orders[i].side === "buy") {
+      endUnsubmitted(i, "order_cancelled", reason);
+      n++;
+    }
+  return n;
+}
+
+/** Stops new entries and cancels unsubmitted buys; exits and position management continue. */
+export function pauseEntries(reason = "Paused manually"): ControlResult {
+  const a = accounts.get("agent")!;
+  a.paused = reason;
   saveAccount(a);
-  journal("control", null, { action });
+  const cancelled = cancelPendingBuys("agent", `Entries paused: ${reason}`);
+  journal("control", null, { action: "pause_entries", cancelled });
+  return { status: "applied", reasonCodes: [], detail: { cancelledBuys: cancelled } };
+}
+
+/** What still blocks entries if the manual pause were lifted. */
+function resumeBlockers(): string[] {
+  const a = accounts.get("agent")!;
+  const e = equityOf("agent");
+  const out: string[] = [];
+  if (!e.complete) out.push("valuation_incomplete");
+  else {
+    if (e.equity <= a.peakEquity * (1 - RISK.maxDrawdown)) out.push("max_drawdown_breached");
+    if (a.dayKey === dayKey() && e.equity <= a.dayStartEquity * (1 - RISK.dailyLossLimit)) out.push("daily_loss_limit_breached");
+  }
+  return out;
+}
+
+/**
+ * Lifts the pause only when the risk gates pass. Never resets history: the peak, the daily baseline,
+ * the loss streak and cooldown all stay (resetting anchors is a separate, explicit command).
+ */
+export function resumeEntries(): ControlResult {
+  const a = accounts.get("agent")!;
+  const blockers = resumeBlockers();
+  if (blockers.length) return { status: "blocked", reasonCodes: blockers, detail: { paused: a.paused } };
+  a.paused = null;
+  saveAccount(a);
+  journal("control", null, { action: "resume_entries" });
+  return { status: "applied", reasonCodes: [], detail: {} };
+}
+
+/** Explicit operator decision: restart the drawdown and daily-loss anchors from the current reliable equity. */
+export function resetRiskAnchors(): ControlResult {
+  const a = accounts.get("agent")!;
+  const e = equityOf("agent");
+  if (!e.complete) return { status: "blocked", reasonCodes: ["valuation_incomplete"], detail: {} };
+  const before = { peakEquity: a.peakEquity, dayStartEquity: a.dayStartEquity, cooldownUntil: a.cooldownUntil };
+  a.peakEquity = e.equity;
+  a.dayStartEquity = e.equity;
+  a.dayKey = dayKey();
+  a.cooldownUntil = 0;
+  a.lossStreak = 0;
+  saveAccount(a);
+  journal("control", null, { action: "reset_risk_anchors", before, equity: e.equity });
+  return { status: "applied", reasonCodes: [], detail: { before, equity: e.equity } };
+}
+
+/** Requests a bounded exit for one position (no fill is assumed; it may wait for a price). */
+export function requestExit(positionId: string, reason = "Exit requested by operator"): ControlResult {
+  const p = positions.get(positionId);
+  if (!p) return { status: "blocked", reasonCodes: ["position_not_found"], detail: {} };
+  if (p.exiting) return { status: "blocked", reasonCodes: ["exit_already_pending"], detail: {} };
+  placeSell(p, 1, reason, null, null, undefined, true);
+  return { status: "applied", reasonCodes: [], detail: { positionId } };
+}
+
+/** Pauses entries and requests exits for every agent position. Positions that can't be priced stay visible. */
+export function requestFlatten(): ControlResult {
+  const paused = pauseEntries("Flatten requested");
+  const requested: string[] = [];
+  const pending: string[] = [];
+  for (const p of positions.values()) {
+    if (p.account !== "agent") continue;
+    if (p.exiting) pending.push(p.id);
+    else {
+      placeSell(p, 1, "Flatten requested by operator", null, null, undefined, true);
+      requested.push(p.id);
+    }
+  }
+  return { status: "applied", reasonCodes: [], detail: { ...paused.detail, exitsRequested: requested, exitsAlreadyPending: pending } };
+}
+
+/** Back-compat for the old /api/control endpoint. */
+export function control(action: "pause" | "resume") {
+  return action === "pause" ? pauseEntries() : resumeEntries();
 }

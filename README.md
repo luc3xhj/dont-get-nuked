@@ -80,6 +80,12 @@ Credentials stay in ignored `.env.local` and private user config (`~/.treg/confi
 
 References: [Treg integration guide](https://treg.to/llms.txt), [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
+## Operations
+
+[docs/operations.md](docs/operations.md) covers startup and recovery, the ledger and sleeves, operator commands, data
+capabilities, strategy readiness, research jobs, discovery and the learning registry. Use
+`npm run report:capabilities` for a live report of usable data routes and supported strategies.
+
 ## Development status and limits
 
 This is a working local research prototype, not a validated profitable strategy. The data → screens → setups → paper execution → measurement loop exists. Reports appear on coin pages and in the activity feed.

@@ -7,9 +7,7 @@ import type { Coin, Trade } from "./types";
 mkdirSync(dirname(CONFIG.dbPath), { recursive: true });
 export const db = new DatabaseSync(CONFIG.dbPath);
 
-// Phase 1 schema change: trades are keyed by transaction so two tape sources can't double count.
-const tradeCols = db.prepare("PRAGMA table_info(trades)").all() as { name: string }[];
-if (tradeCols.length && !tradeCols.some((c) => c.name === "tx")) db.exec("DROP TABLE trades");
+// Schema changes to existing tables go through versioned migrations (agent/schema.ts), never destructive repair.
 
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -33,6 +31,7 @@ db.exec(`
     tokens REAL NOT NULL,
     price_sol REAL NOT NULL,
     program TEXT NOT NULL,
+    received_at INTEGER,
     PRIMARY KEY (mint, tx)
   ) WITHOUT ROWID;
   CREATE INDEX IF NOT EXISTS trades_ts ON trades (ts);
@@ -67,14 +66,17 @@ export function loadCoins(sinceMs: number): Coin[] {
   return (db.prepare("SELECT data FROM coins WHERE updated_at > ?").all(sinceMs) as { data: string }[]).map((r) => JSON.parse(r.data));
 }
 
-const insertTrade = db.prepare(
-  "INSERT OR IGNORE INTO trades (id, tx, mint, ts, slot, wallet, side, sol, tokens, price_sol, program) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-);
+// Prepared on first use: `received_at` may be added by a migration after this module loads.
+let insertTrade: ReturnType<typeof db.prepare> | null = null;
 export function saveTrades(trades: Trade[]) {
   if (!trades.length) return;
+  insertTrade ??= db.prepare(
+    "INSERT OR IGNORE INTO trades (id, tx, mint, ts, slot, wallet, side, sol, tokens, price_sol, program, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
   db.exec("BEGIN");
   try {
-    for (const t of trades) insertTrade.run(t.id, t.tx, t.mint, t.ts, t.slot, t.wallet, t.side, t.sol, t.tokens, t.priceSol, t.program);
+    for (const t of trades)
+      insertTrade.run(t.id, t.tx, t.mint, t.ts, t.slot, t.wallet, t.side, t.sol, t.tokens, t.priceSol, t.program, t.receivedAt ?? null);
     db.exec("COMMIT");
   } catch (e) {
     db.exec("ROLLBACK");
@@ -84,8 +86,11 @@ export function saveTrades(trades: Trade[]) {
 
 export function loadTrades(mint: string): Trade[] {
   return db
-    .prepare("SELECT id, tx, mint, ts, slot, wallet, side, sol, tokens, price_sol AS priceSol, program FROM trades WHERE mint = ? ORDER BY id")
-    .all(mint) as Trade[];
+    .prepare(
+      "SELECT id, tx, mint, ts, slot, wallet, side, sol, tokens, price_sol AS priceSol, program, received_at AS receivedAt FROM trades WHERE mint = ? ORDER BY id",
+    )
+    .all(mint)
+    .map((t) => ({ ...(t as Trade), receivedAt: (t as { receivedAt: number | null }).receivedAt ?? undefined }));
 }
 
 const upsertReport = db.prepare(
@@ -104,11 +109,23 @@ export function journal(kind: string, mint: string | null, data: unknown) {
   insertJournal.run(Date.now(), mint, kind, JSON.stringify(data));
 }
 
-/** Keep the database bounded: drop old tapes for coins we no longer track. */
+/**
+ * Keep the database bounded: drop old tapes and coin records for coins we no longer track. Coins with
+ * an open position or a pending order (`keepMints`) and coins any account has traded are always kept,
+ * so a held market can be recovered no matter how old it is.
+ */
 export function prune(keepMints: Set<string>, olderThanMs: number) {
   const cutoff = Date.now() - olderThanMs;
   const stale = (db.prepare("SELECT DISTINCT mint FROM trades WHERE ts < ?").all(cutoff) as { mint: string }[]).map((r) => r.mint);
   for (const mint of stale) if (!keepMints.has(mint)) db.prepare("DELETE FROM trades WHERE mint = ?").run(mint);
-  // Keep coins the wallet has traded, so their pages and history stay readable.
-  db.prepare("DELETE FROM coins WHERE updated_at < ? AND mint NOT IN (SELECT json_extract(data, '$.mint') FROM closed)").run(cutoff);
+  const old = (db.prepare("SELECT mint FROM coins WHERE updated_at < ? AND mint NOT IN (SELECT json_extract(data, '$.mint') FROM closed)").all(cutoff) as {
+    mint: string;
+  }[]).map((r) => r.mint);
+  for (const mint of old) if (!keepMints.has(mint)) db.prepare("DELETE FROM coins WHERE mint = ?").run(mint);
+}
+
+/** A coin record regardless of age (for recovering held or pending markets). */
+export function loadCoin(mint: string): Coin | null {
+  const row = db.prepare("SELECT data FROM coins WHERE mint = ?").get(mint) as { data: string } | undefined;
+  return row ? (JSON.parse(row.data) as Coin) : null;
 }

@@ -6,12 +6,16 @@ import EvidencePanel from "../EvidencePanel";
 import { ClosedTrades, OpenPositions } from "../PositionsTable";
 import { AnalysisCard, CHANGED, DecisionCard } from "../research/ResearchCards";
 import { useTerminal } from "./data";
+import DiscoveryTab from "./DiscoveryTab";
 import Funnel from "./Funnel";
+import LearningTab from "./LearningTab";
+import SystemTab from "./SystemTab";
 import { TradersTab } from "./Traders";
 import { Metric } from "./ui";
 import type { DockTab, Layout } from "./layout";
-import { pctSigned, SETUP_LABEL, type Account, type DatasetSummary, type Stats } from "@/lib/agent";
+import { pctSigned, SETUP_LABEL, type Account, type DatasetSummary, type OpenPosition, type Stats } from "@/lib/agent";
 import { fmtAge, pnlColor } from "@/lib/format";
+import { describeResult, sendCommand } from "@/lib/commands";
 import { usePolling } from "@/lib/hooks";
 import type { ResearchReport } from "@/lib/research-types";
 
@@ -21,9 +25,12 @@ const TABS: { id: DockTab; label: string }[] = [
   { id: "decisions", label: "Decisions" },
   { id: "research", label: "Research audit" },
   { id: "traders", label: "Traders" },
+  { id: "discovery", label: "Discovery" },
+  { id: "learning", label: "Learning" },
   { id: "performance", label: "Performance" },
   { id: "evidence", label: "What predicts winners" },
   { id: "dataset", label: "Rug dataset" },
+  { id: "system", label: "System" },
 ];
 
 const stat = (s?: Stats) =>
@@ -42,8 +49,10 @@ const stat = (s?: Stats) =>
 
 const ACCOUNTS: { id: Account["id"]; label: string; blurb: string }[] = [
   { id: "agent", label: "Agent wallet", blurb: "Screens, research, measured edge, risk sizing" },
+  { id: "rules", label: "Rules only", blurb: "Comparator: same policy and opportunities, research removed" },
   { id: "shadow", label: "Every setup", blurb: "Benchmark: all fired setups, 0.1◎, no filters" },
   { id: "baseline", label: "Random coins", blurb: "Benchmark: same timing and exits, random coins" },
+  { id: "follower", label: "Wallet follower", blurb: "Experiment: reacts to tracked wallets' buys with its own quotes and exits" },
 ];
 
 function Performance() {
@@ -146,6 +155,34 @@ function Performance() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Agent positions with operator controls (each is an idempotent worker command). */
+function PositionsPanel({ positions }: { positions: OpenPosition[] }) {
+  const [notice, setNotice] = useState<string | null>(null);
+  const run = async (type: "request_exit" | "request_flatten", payload: Record<string, unknown> = {}) => {
+    const r = await sendCommand(type, payload);
+    setNotice(describeResult(r) ?? (type === "request_flatten" ? "Entries paused; exits requested for every position." : "Exit requested."));
+  };
+  return (
+    <div>
+      {positions.length > 0 && (
+        <div className="flex items-center gap-2 border-b border-line px-3 py-1.5 text-[11px]">
+          <span className="text-zinc-500">Exits are requested, not assumed: a position without a fresh price waits and stays visible.</span>
+          {notice && <span className="text-amber-300">{notice}</span>}
+          <button
+            onClick={() => {
+              if (window.confirm("Pause new entries and request exits for every agent position?")) run("request_flatten");
+            }}
+            className="ml-auto rounded border border-rose-900 px-2 py-0.5 text-rose-300 hover:bg-rose-500/10"
+          >
+            Flatten all
+          </button>
+        </div>
+      )}
+      <OpenPositions positions={positions} onExit={(p) => run("request_exit", { positionId: p.id })} />
     </div>
   );
 }
@@ -306,7 +343,7 @@ export default function Dock({ layout, update, onSelect }: { layout: Layout; upd
         </button>
       </div>
       <div className="scroll-thin flex-1 overflow-y-auto">
-        {layout.dockTab === "positions" && <OpenPositions positions={open} />}
+        {layout.dockTab === "positions" && <PositionsPanel positions={open} />}
         {layout.dockTab === "trades" && (
           <div>
             <label className="flex items-center gap-1.5 px-3 pt-2 text-[11px] text-zinc-500">
@@ -319,9 +356,12 @@ export default function Dock({ layout, update, onSelect }: { layout: Layout; upd
         {layout.dockTab === "decisions" && <Decisions onSelect={onSelect} />}
         {layout.dockTab === "research" && <ResearchAudit />}
         {layout.dockTab === "traders" && <TradersTab onSelect={onSelect} />}
+        {layout.dockTab === "discovery" && <DiscoveryTab onSelect={onSelect} />}
+        {layout.dockTab === "learning" && <LearningTab />}
         {layout.dockTab === "performance" && <Performance />}
         {layout.dockTab === "evidence" && <EvidencePanel />}
         {layout.dockTab === "dataset" && <Dataset />}
+        {layout.dockTab === "system" && <SystemTab />}
       </div>
     </div>
   );

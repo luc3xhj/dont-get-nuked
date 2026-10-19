@@ -13,6 +13,7 @@ import { db, journal, saveReport } from "./db";
 import { budget } from "./http";
 import { dsMarket, holderReport } from "./sources";
 import { coins, laneOf, pairAddress, type CoinState } from "./state";
+import { noteMarketCandidate } from "./discovery";
 import type { Lane } from "./state";
 
 export type Range = { min: number | null; max: number | null };
@@ -288,6 +289,8 @@ export function evaluatePulse(s: CoinState, now = Date.now()): PulseEval | null 
   if (f.searchKeywords.length && !f.searchKeywords.some((w) => text.includes(w))) failed.push("keywords");
   if (f.excludeKeywords.some((w) => text.includes(w))) failed.push("keywords");
   const e: PulseEval = { column, status: failed.length ? "fail" : unknown.length ? "checking" : "pass", failed, unknown, at: now };
+  // Market ingress: the first time a coin passes its column's filters it becomes a candidate.
+  if (e.status === "pass" && s.pulse?.status !== "pass") noteMarketCandidate(s.coin.mint, `passed ${column} filters`);
   s.pulse = e;
   return e;
 }
