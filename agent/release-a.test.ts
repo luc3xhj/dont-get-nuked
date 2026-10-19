@@ -114,12 +114,47 @@ test("Release A regressions", async (t) => {
     assert.ok(Math.abs(cash("shadow") - (before - 0.0005)) < 1e-9, "the failed attempt's fee is charged once");
     assert.ok(Math.abs((p.feesSol ?? 0) - 0.0005) < 1e-12, "and attributed to the position");
     draws = [];
+    now += 6_000; // past the 5s retry backoff
     setPrice(s, 1.7e-6);
     pf.portfolioTick(); // retry
     tick();
     p = shadowPosition(s.coin.mint)!;
     assert.equal(p.tp1Done, true);
     assert.ok(Math.abs(p.tokens - p0.tokens / 2) < 1e-6, "sold exactly the TP1 fraction");
+    assert.ok(pf.reconciliationReport().ok, pf.reconciliationReport().issues.join("; "));
+  });
+
+  await t.test("finite exit retries: three failures exhaust the intent; restart doesn't reset it", () => {
+    const s = coin();
+    pf.onSignals(s, [fire()]);
+    tick();
+    const p0 = shadowPosition(s.coin.mint)!;
+    const fees0 = p0.feesSol ?? 0;
+    for (let i = 0; i < 3; i++) {
+      draws = [0.01]; // every stop attempt fails
+      now += 30_000;
+      setPrice(s, 0.7e-6);
+      pf.portfolioTick(); // place the stop exit
+      now += 4_000;
+      s.quote = { ...s.quote!, at: now };
+      pf.portfolioTick(); // it fails
+    }
+    let p = shadowPosition(s.coin.mint)!;
+    assert.equal(p.tokens, p0.tokens, "inventory unchanged");
+    assert.ok(Math.abs((p.feesSol ?? 0) - fees0 - 3 * 0.0005) < 1e-12, "exactly three chargeable failures");
+    pf.restorePortfolio(); // a restart keeps the exhausted budget
+    draws = [];
+    now += 60_000;
+    setPrice(s, 0.7e-6);
+    pf.portfolioTick();
+    assert.equal(pf.portfolioReport().pending.filter((o) => o.side === "sell" && o.account === "shadow" && o.mint === s.coin.mint).length, 0, "no automatic fourth attempt");
+    // An explicit operator request is a new intent with its own budget.
+    assert.equal(pf.requestExit(p.id).status, "applied");
+    now += 4_000;
+    s.quote = { ...s.quote!, at: now };
+    pf.portfolioTick();
+    p = shadowPosition(s.coin.mint)!;
+    assert.equal(p, undefined, "the operator exit filled and closed the lot");
     assert.ok(pf.reconciliationReport().ok, pf.reconciliationReport().issues.join("; "));
   });
 

@@ -20,6 +20,8 @@ const SHORTCUTS: [string, string][] = [
   ["?", "This help"],
 ];
 const DOCK_KEYS: DockTab[] = ["positions", "trades", "decisions", "research", "traders", "discovery", "learning", "performance", "evidence"];
+/** Every tab can be deep-linked with ?dock=…, including those without a number key. */
+const ALL_TABS: DockTab[] = [...DOCK_KEYS, "dataset", "system"];
 const FOLLOWED = new Set(["buy", "sell", "win", "loss", "setup", "analyst", "trader"]);
 
 function Shell() {
@@ -42,7 +44,7 @@ function Shell() {
   // Deep links from the old pages: ?dock=research etc.
   useEffect(() => {
     const dock = params.get("dock") as DockTab | null;
-    if (dock && DOCK_KEYS.includes(dock)) update({ dock: true, dockTab: dock });
+    if (dock && ALL_TABS.includes(dock)) update({ dock: true, dockTab: dock });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

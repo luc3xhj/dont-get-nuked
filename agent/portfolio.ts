@@ -120,6 +120,11 @@ export type Position = {
   /** Funded sleeve (immutable) and the sleeve currently managing the lot (management transfer is disabled). */
   sleeveId?: SleeveId;
   managementSleeveId?: SleeveId;
+  /** Failed attempts of the current exit intent, the next allowed retry, and degradation once exhausted. */
+  exitFailures?: number;
+  exitRetryAt?: number;
+  exitIntent?: string;
+  exitDegradedAt?: number | null;
 };
 
 export type Closed = {
@@ -929,7 +934,16 @@ function processOrders() {
             a.cash = post({ account: o.account, type: "attempt_fee", cashLamports: -toLamports(fill.feeSol), mint: o.mint, orderId: o.id, positionId: p.id, sleeve: p.sleeveId ?? null, payload: { side: "sell", reason: fill.reason, kind: o.kind ?? null } });
             p.feesSol = (p.feesSol ?? 0) + fill.feeSol;
           }
-          p.exiting = false; // retry on the next tick
+          p.exiting = false;
+          // Bounded retries: exponential backoff, and no automatic attempt after the budget is spent
+          // (inventory stays visible; a new, different exit intent or an operator request may try again).
+          p.exitFailures = (p.exitFailures ?? 0) + 1;
+          p.exitIntent = o.reason;
+          p.exitRetryAt = now + EXIT_RETRY.baseMs * 2 ** (p.exitFailures - 1);
+          if (p.exitFailures >= EXIT_RETRY.maxFailures) {
+            p.exitDegradedAt = now;
+            journal("exit_degraded", o.mint, { positionId: p.id, account: o.account, intent: o.reason, failures: p.exitFailures });
+          }
           saveAccount(a);
           savePosition(p);
           journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "sell", reason: fill.reason, feeSol: fill.feeSol, positionId: p.id });
@@ -942,6 +956,9 @@ function processOrders() {
         p.proceedsSol += fill.sol;
         p.tokens -= tokensIn;
         p.exiting = false;
+        p.exitFailures = 0;
+        p.exitRetryAt = undefined;
+        p.exitDegradedAt = null;
         if (o.kind === "tp1") {
           // Only a confirmed TP1 fill locks in: stop to breakeven plus costs, then trail.
           p.tp1Done = true;
@@ -958,6 +975,9 @@ function processOrders() {
   }
 }
 
+/** Exit attempts: 3 chargeable failures per intent, backoff 5s → 10s → 20s; the budget survives restarts. */
+export const EXIT_RETRY = { maxFailures: 3, baseMs: 5_000 };
+
 function placeSell(
   p: Position,
   fraction: number,
@@ -965,8 +985,21 @@ function placeSell(
   analysisId: string | null = null,
   withoutExitReason: string | null = null,
   kind?: Order["kind"],
+  operator = false,
 ) {
   const now = Date.now();
+  const sameIntent = p.exitIntent === reason;
+  if (!operator && sameIntent) {
+    if (p.exitDegradedAt) return; // budget exhausted for this intent: no automatic fourth attempt
+    if (p.exitRetryAt && now < p.exitRetryAt) return; // backing off
+  }
+  if (!sameIntent || operator) {
+    // A new intent (different reason, or an explicit operator request) starts its own attempt budget.
+    p.exitFailures = 0;
+    p.exitDegradedAt = null;
+    p.exitRetryAt = undefined;
+    p.exitIntent = reason;
+  }
   p.exiting = true;
   const decisionId = uid();
   const orderId = uid();
@@ -1279,7 +1312,7 @@ export function requestExit(positionId: string, reason = "Exit requested by oper
   const p = positions.get(positionId);
   if (!p) return { status: "blocked", reasonCodes: ["position_not_found"], detail: {} };
   if (p.exiting) return { status: "blocked", reasonCodes: ["exit_already_pending"], detail: {} };
-  placeSell(p, 1, reason);
+  placeSell(p, 1, reason, null, null, undefined, true);
   return { status: "applied", reasonCodes: [], detail: { positionId } };
 }
 
@@ -1292,7 +1325,7 @@ export function requestFlatten(): ControlResult {
     if (p.account !== "agent") continue;
     if (p.exiting) pending.push(p.id);
     else {
-      placeSell(p, 1, "Flatten requested by operator");
+      placeSell(p, 1, "Flatten requested by operator", null, null, undefined, true);
       requested.push(p.id);
     }
   }

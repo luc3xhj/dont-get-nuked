@@ -13,6 +13,8 @@
     "agent:install": "node scripts/agent-service.mjs install",
     "agent:start": "node scripts/agent-service.mjs start",
     "replay:decisions": "node --import tsx agent/replay-decisions.ts",
+    "report:capabilities": "node scripts/capability-report.mjs",
+    "db:backup": "node --import tsx scripts/db-backup.ts",
     "agent:stop": "node scripts/agent-service.mjs stop",
     "agent:status": "node scripts/agent-service.mjs status",
     "agent:uninstall": "node scripts/agent-service.mjs uninstall"
