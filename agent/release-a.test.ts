@@ -15,12 +15,14 @@ test("Release A regressions", async (t) => {
 
   let now = 1_800_000_000_000;
   t.mock.method(Date, "now", () => now);
+  // Execution draws are injected: each queued value is the next order's failure draw (default: success).
   let draws: number[] = [];
-  t.mock.method(Math, "random", () => (draws.length ? draws.shift()! : 0.5));
+  pf.setDrawSource(() => ({ latency: 0.5, fail: draws.length ? draws.shift()! : 0.5 }));
+  t.mock.method(Math, "random", () => 0.5);
   pf.restorePortfolio();
 
   const journalKinds = (kind: string) => db.prepare("SELECT data FROM journal WHERE kind = ?").all(kind).map((r) => JSON.parse((r as { data: string }).data));
-  const cash = (id: "agent" | "shadow" | "baseline") => pf.equityOf(id).cash;
+  const cash = (id: "agent" | "rules" | "shadow" | "baseline") => pf.equityOf(id).cash;
 
   let n = 0;
   /** A migrated coin on a 100 SOL / 100M token pool (spot 1e-6 SOL). */
@@ -54,7 +56,7 @@ test("Release A regressions", async (t) => {
   };
 
   await t.test("exactly one opening credit; cash is the ledger sum", () => {
-    for (const id of ["agent", "shadow", "baseline"] as const) {
+    for (const id of ["agent", "rules", "shadow", "baseline"] as const) {
       assert.equal(ledger.ledgerEvents({ account: id }).filter((e) => e.type === "opening_capital").length, 1);
       assert.equal(cash(id), 10);
     }
@@ -103,7 +105,7 @@ test("Release A regressions", async (t) => {
     const before = cash("shadow");
     now += 1000;
     setPrice(s, 1.7e-6); // above TP1
-    draws = [0.5, 0.01]; // TP1 sell: latency draw, then a failing draw
+    draws = [0.01]; // the TP1 sell's failure draw
     pf.portfolioTick();
     tick();
     let p = shadowPosition(s.coin.mint)!;

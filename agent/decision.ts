@@ -204,7 +204,7 @@ export function decideFrom(snap: DecisionSnapshot): DecisionResult {
   if (mode === "evidence" && evd.shrunkR < R.minEdgeR)
     reasons.push(`No edge yet: benchmark avg ${evd.avgR.toFixed(2)}R over ${evd.n} trades (${(evd.winRate * 100).toFixed(0)}% wins)`);
 
-  const fresh = snap.analysis && snap.analysis.expiresAt > snap.at ? snap.analysis : null;
+  const fresh = snap.analysis && snap.analysis.expiresAt > snap.at && (snap.analysis.availableAt ?? snap.analysis.at) <= snap.at ? snap.analysis : null;
   const analyst = fresh
     ? { verdict: fresh.verdict, conviction: fresh.conviction, note: fresh.verdict === "reject" ? (fresh.redFlags[0] ?? fresh.thesis) : fresh.narrative }
     : { verdict: "none" as const, conviction: R.noAnalysisScale, note: "No fresh analyst verdict" };

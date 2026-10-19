@@ -166,7 +166,7 @@ export type Stats = {
   expectancySol: number;
   bestShare: number | null;
 };
-export type AccountId = "agent" | "shadow" | "baseline";
+export type AccountId = "agent" | "rules" | "shadow" | "baseline";
 export type Account = {
   id: AccountId;
   cash: number;
@@ -266,6 +266,10 @@ export type ActivityItem = {
 };
 
 export const SETUP_LABEL: Record<string, string> = {
+  early_momentum: "Fast · early momentum",
+  first_shallow_pullback: "Fast · first shallow pullback",
+  migration_event: "Fast · migration response",
+  breakout_continuation: "Fast · breakout continuation",
   new_dump: "New pair · first dump",
   stretch_deep: "Final Stretch · deep selloff",
   stretch_pullback: "Final Stretch · pullback",

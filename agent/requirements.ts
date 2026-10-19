@@ -3,6 +3,8 @@
 import { CONFIG } from "./config";
 import type { EssentialCheck } from "./decision";
 import type { SetupId } from "./setups";
+
+const FAST = new Set<SetupId>(["early_momentum", "first_shallow_pullback", "migration_event", "breakout_continuation"]);
 import type { CoinState } from "./state";
 
 const age = (at: number, now: number) => `${Math.round((now - at) / 60_000)}m old`;
@@ -41,7 +43,10 @@ export function essentialsFor(s: CoinState, setup: SetupId, now = Date.now()): E
   const fu = s.funding;
   const coverage = fu?.coverage ?? 1;
   const fundingFresh = !!fu && now - fu.at <= D.fundingMaxAgeMs;
-  add(
+  // Fast strategies decide within seconds; top-holder funding is optional for them (a found cluster still
+  // vetoes through the risk screens). Every other strategy requires it.
+  if (!FAST.has(setup))
+    add(
     "funding",
     "Top-holder funding",
     fundingFresh && coverage >= D.minFundingCoverage,
@@ -55,7 +60,7 @@ export function essentialsFor(s: CoinState, setup: SetupId, now = Date.now()): E
             }`
           : `${fu.checked}/${fu.requested ?? fu.checked} wallets, ${(coverage * 100).toFixed(0)}% coverage, ${age(fu.at, now)}`,
   );
-  if (setup === "new_dump" || setup === "dev_base")
+  if (setup === "new_dump" || setup === "dev_base" || setup === "early_momentum" || setup === "first_shallow_pullback")
     add(
       "cohorts",
       "Launch cohorts",
@@ -66,7 +71,7 @@ export function essentialsFor(s: CoinState, setup: SetupId, now = Date.now()): E
     const dv = s.dev;
     add("dev", "Developer history", !!dv && now - dv.at <= D.devMaxAgeMs, !dv ? "not looked up" : now - dv.at <= D.devMaxAgeMs ? age(dv.at, now) : `stale (${age(dv.at, now)})`);
   }
-  if (setup === "migrated_base") {
+  if (setup === "migrated_base" || setup === "migration_event") {
     const at = s.coin.migratedAt;
     add("migration", "Migration time", at != null, at != null ? `${Math.round((now - at) / 60_000)}m ago (${s.coin.migratedAtSource ?? "?"})` : "unknown");
   }

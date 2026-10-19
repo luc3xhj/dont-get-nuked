@@ -31,6 +31,9 @@ import {
 import { commandStatus, executeCommand, stateRevision } from "./commands";
 import { appliedVersions, runMigrations } from "./migrations";
 import { MIGRATIONS } from "./schema";
+import { capabilityReport } from "./capabilities";
+import { jobsReport, recoverJobs } from "./jobs";
+import { startLifecycleStream, stopLifecycleStream } from "./streams";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { restoreEpisodes, trackEpisodes } from "./episodes";
 import { evaluateSetups } from "./setups";
@@ -179,6 +182,8 @@ const server = createServer((req, res) => {
     return c ? send(res, 200, c) : send(res, 404, { error: "Unknown command" });
   }
   if (url.pathname === "/api/health") return send(res, 200, health());
+  if (url.pathname === "/api/capabilities") return send(res, 200, capabilityReport());
+  if (url.pathname === "/api/jobs") return send(res, 200, jobsReport());
   if (url.pathname === "/api/reconciliation") return send(res, 200, reconciliationReport());
   if (url.pathname === "/api/traders") {
     if (req.method === "GET") return send(res, 200, tradersReport());
@@ -337,6 +342,7 @@ try {
 restore();
 restorePortfolio();
 restoreEpisodes();
+recoverJobs();
 markVersionStart();
 // Every market the portfolio depends on is restored regardless of age or discovery status.
 {
@@ -352,6 +358,8 @@ server.listen(CONFIG.port, "127.0.0.1", () => console.log(`agent API on http://1
 journal("start", null, { config: CONFIG });
 
 loop("universe", CONFIG.universe.refreshMs, refreshUniverse);
+// Real-time launches and migrations (free PumpPortal subscriptions only).
+if (process.env.LIFECYCLE_STREAM !== "off") startLifecycleStream();
 loop("tape", 1_000, () => tapeTick(evaluate));
 loop("reports", 5_000, reportsTick);
 loop("quotes", 2_000, quoteTick);
@@ -390,6 +398,7 @@ for (const sig of ["SIGINT", "SIGTERM"] as const)
     const cancelled = (["agent", "shadow", "baseline"] as const).reduce((n, id) => n + cancelPendingBuys(id, "Worker stopping"), 0);
     journal("stop", null, { signal: sig, cancelledBuys: cancelled, openPositions: heldMints().size });
     workerState = "stopped";
+    stopLifecycleStream();
     server.close();
     process.exit(0);
   });

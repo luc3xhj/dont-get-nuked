@@ -23,7 +23,9 @@ export type Coin = {
   updatedAt: number;
   /** When it migrated to PumpSwap: pool creation time if known, else when we observed the change. */
   migratedAt?: number | null;
-  migratedAtSource?: "pool_created" | "observed" | null;
+  migratedAtSource?: "pool_created" | "observed" | "migration_stream" | null;
+  /** When the launch event reached us from a real-time stream (its source event time is unknown). */
+  launchObservedAt?: number | null;
 };
 
 export type Trade = {

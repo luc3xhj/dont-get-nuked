@@ -3,6 +3,7 @@
 // nothing is auto-applied — small samples in this market are mostly noise.
 import { CONFIG } from "./config";
 import { db } from "./db";
+import { seededRandom } from "./execution";
 
 type Closed = { mint: string; setup: string; openedAt: number; pnlSol: number; r: number; account: string; version?: string };
 type Signal = { ts: number; mint: string; setup: string; screens: { id: string; level: string }[]; features: Record<string, unknown> | null };
@@ -75,7 +76,9 @@ function rows(versions: string[] | null): { shadow: Row[]; baselineR: number[] }
 function bootstrapDiff(a: number[], b: number[], iters = 2000): [number, number] | null {
   if (a.length < 5 || b.length < 5) return null;
   const mean = (xs: number[]) => xs.reduce((s, x) => s + x, 0) / xs.length;
-  const pick = (xs: number[]) => Array.from({ length: xs.length }, () => xs[Math.floor(Math.random() * xs.length)]);
+  // Statistics use their own seeded stream: reports are reproducible and never touch execution randomness.
+  const rand = seededRandom(`stats:${a.length}:${b.length}`);
+  const pick = (xs: number[]) => Array.from({ length: xs.length }, () => xs[Math.floor(rand() * xs.length)]);
   const diffs = Array.from({ length: iters }, () => mean(pick(a)) - mean(pick(b))).sort((x, y) => x - y);
   return [diffs[Math.floor(iters * 0.05)], diffs[Math.floor(iters * 0.95)]];
 }

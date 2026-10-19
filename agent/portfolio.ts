@@ -8,7 +8,7 @@ import { CONFIG } from "./config";
 import { db, journal } from "./db";
 import { costModel, decideFrom, POST_TP1_STOP, TP1_FRACTION, type DecisionResult, type DecisionSnapshot } from "./decision";
 import { cashLamports, hasOpening, positionNetLamports, post, resetLedgerCache, toLamports, toSol } from "./ledger";
-import { EXEC, fillBuy, fillSell, latency, liquidationValue, poolOf } from "./execution";
+import { EXEC, fillBuy, fillSell, latency, liquidationValue, poolOf, seededRandom } from "./execution";
 import { essentialsFor } from "./requirements";
 import { SETUP_LABEL, type Plan, type SetupEval, type SetupId } from "./setups";
 import type { Analysis } from "./analyst";
@@ -16,7 +16,12 @@ import { regime } from "./regime";
 import { coins, type CoinState } from "./state";
 import { analysisKey } from "./analysis-impact";
 
-export type AccountId = "agent" | "shadow" | "baseline";
+/**
+ * agent: the strategy with research · rules: the same policy on the same opportunities with research removed
+ * (measures research's net contribution) · shadow: every fired setup at a fixed size · baseline: random coins.
+ * Each is a separately funded paper account with its own opening credit.
+ */
+export type AccountId = "agent" | "rules" | "shadow" | "baseline";
 
 export const RISK = {
   startCash: 10,
@@ -171,10 +176,12 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY, at INTEGER NOT NULL, mint TEXT NOT NULL, version TEXT NOT NULL, snapshot TEXT NOT NULL, result TEXT NOT NULL);
   CREATE INDEX IF NOT EXISTS decisions_at ON decisions (at);
+  -- The rules-only comparator's decision on the same opportunity (opportunity_id = the agent decision id).
+  CREATE TABLE IF NOT EXISTS comparator_decisions (id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL, account TEXT NOT NULL, at INTEGER NOT NULL, snapshot TEXT NOT NULL, result TEXT NOT NULL);
 `);
 
 const dayKey = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
-const IDS: AccountId[] = ["agent", "shadow", "baseline"];
+const IDS: AccountId[] = ["agent", "rules", "shadow", "baseline"];
 
 const accounts = new Map<AccountId, Account>();
 const positions = new Map<string, Position>();
@@ -362,7 +369,17 @@ const uid = () => crypto.randomUUID();
 const openFor = (account: AccountId, mint: string) => [...positions.values()].some((p) => p.account === account && p.mint === mint);
 const pendingFor = (account: AccountId, mint: string) => orders.some((o) => o.account === account && o.mint === mint);
 
-const newDraws = () => ({ latency: Math.random(), fail: Math.random() });
+/**
+ * Execution randomness is reproducible from the order id alone (independent of the statistics' random
+ * stream, so viewing reports can never change a fill). Tests may inject a source.
+ */
+let drawSource = (orderId: string) => {
+  const r = seededRandom(`exec:${orderId}`);
+  return { latency: r(), fail: r() };
+};
+export const setDrawSource = (fn: typeof drawSource) => {
+  drawSource = fn;
+};
 
 const EXEC_ASSUMPTIONS = () => ({ adverseSlippage: EXEC.adverseSlippage, networkFeeSol: NETWORK_FEE_SOL, maxImpact: RISK.maxImpact, stopGap: RISK.stopGap });
 
@@ -389,9 +406,10 @@ function placeBuy(
   if (!(r0Sol > 0) || !(plan.stopSol < plan.entrySol)) return reject("non_positive_planned_risk", { r0Sol });
   const reserveSol = solIn + NETWORK_FEE_SOL;
   if (spendableOf(account) < reserveSol) return reject("insufficient_funds", { spendable: spendableOf(account), required: reserveSol });
-  const draws = newDraws();
+  const id = uid();
+  const draws = drawSource(id);
   const o: Order = {
-    id: uid(),
+    id,
     decisionId: decision?.id,
     analysisId: decision?.impact.analysisId,
     analystVerdict: decision?.analyst.verdict,
@@ -410,7 +428,8 @@ function placeBuy(
     draws,
     reserveSol,
     r0Sol,
-    submitBy: now + EXEC.orderTimeoutMs,
+    // The entry can't be submitted after its signal expires (each strategy declares its own TTL).
+    submitBy: now + (plan.entryTtlMs ?? EXEC.orderTimeoutMs),
   };
   addOrder(o);
   journal("order", s.coin.mint, {
@@ -438,11 +457,11 @@ const creatorOf = (mint: string) => coins.get(mint)?.coin.creator;
 const snapshotAnalysis = (a: Analysis | null): Analysis | null => (a ? { ...a, research: undefined } : null);
 
 /** Everything the agent's decision depends on, frozen at decision time (replayable with decideFrom). */
-export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now()): DecisionSnapshot {
-  const a = accounts.get("agent")!;
-  const { equity } = equityOf("agent");
-  const agentPositions = [...positions.values()].filter((x) => x.account === "agent");
-  const agentBuys = orders.filter((o) => o.account === "agent" && o.side === "buy");
+export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now(), accountId: "agent" | "rules" = "agent"): DecisionSnapshot {
+  const a = accounts.get(accountId)!;
+  const { equity } = equityOf(accountId);
+  const agentPositions = [...positions.values()].filter((x) => x.account === accountId);
+  const agentBuys = orders.filter((o) => o.account === accountId && o.side === "buy");
   const creator = s.coin.creator;
   const sameCreatorOpen =
     agentPositions.filter((p) => p.mint !== s.coin.mint && (p.creator ?? creatorOf(p.mint)) === creator).length +
@@ -462,11 +481,11 @@ export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now()): De
     evidence: evd,
     account: {
       equity,
-      cash: spendableOf("agent"),
+      cash: spendableOf(accountId),
       open: agentPositions.length + agentBuys.length,
       gate: riskGate(a),
-      busy: openFor("agent", s.coin.mint) || pendingFor("agent", s.coin.mint),
-      reentry: now - (lastExit.get(`agent:${s.coin.mint}`) ?? 0) < RISK.reentryCooldownMs,
+      busy: openFor(accountId, s.coin.mint) || pendingFor(accountId, s.coin.mint),
+      reentry: now - (lastExit.get(`${accountId}:${s.coin.mint}`) ?? 0) < RISK.reentryCooldownMs,
       sameCreatorOpen: sameCreatorOpen >= RISK.maxPerCreator ? sameCreatorOpen : 0,
     },
     regime: { level: regime.level, reasons: [...regime.reasons] },
@@ -545,6 +564,19 @@ export function onSignals(s: CoinState, fired: SetupEval[]) {
       journal("decision", s.coin.mint, { setup: ev.setup, ...d, essentials: snapshot.essentials });
       recentDecisions.unshift({ at: now, mint: s.coin.mint, symbol: s.coin.symbol, setup: ev.setup, ...d, essentials: snapshot.essentials });
       recentDecisions.length = Math.min(recentDecisions.length, 100);
+      // Comparator on the same opportunity: identical policy and snapshot, research removed.
+      if (!openFor("rules", s.coin.mint) && !pendingFor("rules", s.coin.mint)) {
+        const rs = { ...buildSnapshot(s, ev, now, "rules"), analysis: null, essentials: snapshot.essentialsWithoutAnalysis ?? snapshot.essentials };
+        const r = { id: uid(), version: rs.strategyVersion, ...decideFrom(rs) };
+        db.prepare("INSERT INTO comparator_decisions (id, opportunity_id, account, at, snapshot, result) VALUES (?, ?, 'rules', ?, ?, ?)").run(
+          r.id,
+          d.id,
+          now,
+          JSON.stringify(rs),
+          JSON.stringify(r),
+        );
+        if (r.take) placeBuy("rules", s, r.sizeSol, ev.setup, ev.plan, evidence, `${SETUP_LABEL[ev.setup]} · rules only`, r);
+      }
       if (d.take)
         placeBuy(
           "agent",
@@ -795,7 +827,7 @@ function placeSell(
   p.exiting = true;
   const decisionId = uid();
   const orderId = uid();
-  const draws = newDraws();
+  const draws = drawSource(orderId);
   addOrder({
     id: orderId,
     decisionId,

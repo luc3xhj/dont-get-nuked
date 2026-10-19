@@ -4,11 +4,17 @@
 import { codexBin, runCodex } from "./codex";
 import { journal, saveReport } from "./db";
 import { buildEvidence } from "./research";
+import { enqueue, finishJob, nextJob, startJob } from "./jobs";
 import { coins, pinned, type CoinState } from "./state";
 import type { ResearchBundle } from "../src/lib/research-types";
 
 export type Analysis = {
   id?: string;
+  /** The research job that produced it. */
+  jobId?: string;
+  /** Latest evidence time the report used, and when it became available to decisions. */
+  inputCutoff?: number;
+  availableAt?: number;
   research?: ResearchBundle;
   at: number;
   expiresAt: number;
@@ -129,12 +135,12 @@ export function evidenceFingerprint(s: CoinState): string {
 const nearTrigger = (s: CoinState) => Math.max(0, ...s.setups.map((x) => x.trigger.filter((k) => k.ok).length / Math.max(1, x.trigger.length)));
 
 /**
- * Who gets researched next: open positions, then firing and armed setups (closest to their trigger
- * first), then promising coins from the Pulse list. Research usually starts while a setup is still
- * developing, so a valid report is in place when the trigger fires.
+ * Who needs research: open positions, then firing and armed setups (closest to their trigger first),
+ * then promising coins from the Pulse list. Research usually starts while a setup is still developing,
+ * so a valid report is in place when the trigger fires. Each becomes (or refreshes) a queued
+ * token_research job with a deadline after which the result would be useless.
  */
-function pick(): CoinState | null {
-  const now = Date.now();
+function enqueueResearch(now = Date.now()) {
   const priority = (s: CoinState) =>
     pinned.has(s.coin.mint)
       ? 10
@@ -155,11 +161,12 @@ function pick(): CoinState | null {
     // Still valid: only a material change in the evidence justifies asking again.
     return urgent && basis.has(s.coin.mint) && basis.get(s.coin.mint) !== evidenceFingerprint(s);
   };
-  return (
-    [...coins.values()]
-      .filter((s) => s.hot && s.features && priority(s) > 0 && due(s))
-      .sort((a, b) => priority(b) - priority(a))[0] ?? null
-  );
+  for (const s of [...coins.values()].filter((x) => x.hot && x.features && priority(x) > 0 && due(x))) {
+    const p = priority(s);
+    // Held: soon (risk review). Firing: within its entry window. Armed: while it develops. Pulse: low urgency.
+    const deadline = now + (p >= 10 ? 3 : p >= 8 ? 2 : p >= 4 ? 10 : 20) * 60_000;
+    enqueue("token_research", s.coin.mint, p, deadline, { symbol: s.coin.symbol, fingerprint: evidenceFingerprint(s) }, now);
+  }
 }
 
 export async function analystTick() {
@@ -170,8 +177,16 @@ export async function analystTick() {
   // Setup problems (not installed / not logged in) are re-checked every 10 minutes, not every tick.
   if ((analystHealth.status === "not-installed" || analystHealth.status === "not-logged-in") && now - (analystHealth.calls.at(-1) ?? 0) < 10 * 60_000)
     return;
-  const s = pick();
-  if (!s) return;
+  enqueueResearch(now);
+  const job = nextJob(now);
+  if (!job) return;
+  const s = coins.get(job.subject);
+  if (!s) {
+    finishJob(job.id, "skipped", { error: "coin no longer tracked" });
+    return;
+  }
+  // Evidence collected after this point can't enter this report.
+  startJob(job.id, now);
 
   const fingerprint = evidenceFingerprint(s);
   // Whether this research was meant for a live setup (it is "late" if that setup is gone when it lands).
@@ -190,6 +205,8 @@ export async function analystTick() {
     const hasContractEvidence = evidence.research.sources.some((source) => source.mentionsContract);
     const a: Analysis = {
       id: crypto.randomUUID(),
+      jobId: job.id,
+      inputCutoff: evidence.research?.at ?? now,
       research: evidence.research,
       at: Date.now(),
       expiresAt: Date.now() + Math.min(30, Math.max(3, Number(o.ttlMinutes) || 10)) * 60_000,
@@ -208,8 +225,11 @@ export async function analystTick() {
       sources: ((o.sources as string[]) ?? []).map(String).filter((u) => allowedUrls.has(u)),
       durationMs: Date.now() - started,
     };
+    // The report becomes usable for decisions only from its completion time onward.
+    a.availableAt = Date.now();
     s.analysis = a;
     basis.set(s.coin.mint, fingerprint);
+    finishJob(job.id, "done", { reportId: a.id });
     saveReport(s.coin.mint, "analysis", a.at, a);
     // in_time: a setup (or position) is still live · late: the setup it was for is gone ·
     // early: discovery research on a promising coin before any setup formed.
@@ -231,6 +251,7 @@ export async function analystTick() {
     analystHealth.status = code === "not-installed" ? "not-installed" : code === "not-logged-in" ? "not-logged-in" : "error";
     analystHealth.lastError = e instanceof Error ? e.message : String(e);
     failedAt.set(s.coin.mint, Date.now());
+    finishJob(job.id, "failed", { error: analystHealth.lastError ?? "error" });
     journal("analysis_error", s.coin.mint, { error: analystHealth.lastError, symbol: s.coin.symbol, research });
   } finally {
     analystHealth.running = null;

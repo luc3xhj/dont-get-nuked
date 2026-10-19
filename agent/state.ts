@@ -24,6 +24,8 @@ export type CoinState = {
   backfilled: boolean;
   /** Polls whose page had no overlap with the tape we held (trades may be missing). */
   tapeGaps: number;
+  /** When the live tape was last successfully polled (fast strategies require it to be recent). */
+  lastPolledAt?: number;
   nextPollAt: number;
   holders: HolderReport | null;
   social: SocialReport | null;
@@ -83,12 +85,37 @@ function stateFor(coin: Coin): CoinState {
     s.coin = {
       ...coin,
       firstSeen: s.coin.firstSeen,
-      // Keep what we learned about migration; list data doesn't carry it.
-      migratedAt: s.coin.migratedAt ?? (migratedNow ? Date.now() : null),
-      migratedAtSource: s.coin.migratedAtSource ?? (migratedNow ? "observed" : null),
+      // Keep what we learned about lifecycle; list data doesn't carry it.
+      migratedAt: s.coin.migratedAt ?? coin.migratedAt ?? (migratedNow ? Date.now() : null),
+      migratedAtSource: s.coin.migratedAtSource ?? coin.migratedAtSource ?? (migratedNow ? "observed" : null),
+      launchObservedAt: s.coin.launchObservedAt ?? coin.launchObservedAt ?? null,
     };
   }
   return s;
+}
+
+/** A coin seen first on a real-time stream (merged with list data later; lifecycle facts are kept). */
+export function ingestStreamCoin(coin: Coin): CoinState {
+  const s = stateFor(coin);
+  saveCoin(s.coin);
+  return s;
+}
+
+/** Records a migration observed on a real-time stream (receipt time; the stream gives no event time). */
+export function recordStreamMigration(mint: string, receivedAt: number, pool: string | null) {
+  const s = coins.get(mint);
+  if (!s) return false;
+  if (s.coin.stage === "curve" && Date.now() - stats.startedAt > 120_000) graduations.push(receivedAt);
+  s.coin = {
+    ...s.coin,
+    stage: "migrated",
+    pool: pool ?? s.coin.pool,
+    // A pool-creation time from the chain is better than our receipt time; keep it if we have it.
+    migratedAt: s.coin.migratedAtSource === "pool_created" ? s.coin.migratedAt : receivedAt,
+    migratedAtSource: s.coin.migratedAtSource === "pool_created" ? "pool_created" : "migration_stream",
+  };
+  saveCoin(s.coin);
+  return true;
 }
 
 export function restore() {
@@ -330,6 +357,7 @@ async function pollTape(s: CoinState) {
   const fresh = page.filter((t) => addTrade(s, t));
   saveTrades(fresh);
   notifyTrades(s, fresh);
+  s.lastPolledAt = receivedAt;
   saveCoverage(s);
   stats.tradesIngested += fresh.length;
   const last = s.trades.at(-1);

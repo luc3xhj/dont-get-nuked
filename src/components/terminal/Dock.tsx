@@ -7,6 +7,7 @@ import { ClosedTrades, OpenPositions } from "../PositionsTable";
 import { AnalysisCard, CHANGED, DecisionCard } from "../research/ResearchCards";
 import { useTerminal } from "./data";
 import Funnel from "./Funnel";
+import SystemTab from "./SystemTab";
 import { TradersTab } from "./Traders";
 import { Metric } from "./ui";
 import type { DockTab, Layout } from "./layout";
@@ -25,6 +26,7 @@ const TABS: { id: DockTab; label: string }[] = [
   { id: "performance", label: "Performance" },
   { id: "evidence", label: "What predicts winners" },
   { id: "dataset", label: "Rug dataset" },
+  { id: "system", label: "System" },
 ];
 
 const stat = (s?: Stats) =>
@@ -43,6 +45,7 @@ const stat = (s?: Stats) =>
 
 const ACCOUNTS: { id: Account["id"]; label: string; blurb: string }[] = [
   { id: "agent", label: "Agent wallet", blurb: "Screens, research, measured edge, risk sizing" },
+  { id: "rules", label: "Rules only", blurb: "Comparator: same policy and opportunities, research removed" },
   { id: "shadow", label: "Every setup", blurb: "Benchmark: all fired setups, 0.1◎, no filters" },
   { id: "baseline", label: "Random coins", blurb: "Benchmark: same timing and exits, random coins" },
 ];
@@ -351,6 +354,7 @@ export default function Dock({ layout, update, onSelect }: { layout: Layout; upd
         {layout.dockTab === "performance" && <Performance />}
         {layout.dockTab === "evidence" && <EvidencePanel />}
         {layout.dockTab === "dataset" && <Dataset />}
+        {layout.dockTab === "system" && <SystemTab />}
       </div>
     </div>
   );
