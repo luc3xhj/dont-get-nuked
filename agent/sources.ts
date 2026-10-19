@@ -1,7 +1,8 @@
 // Free data sources. Everything external is untrusted data: parsed defensively, never executed.
 import { CONFIG } from "./config";
 import { getJson } from "./http";
-import type { Coin, DevReport, HolderReport, Quote, SocialReport, Trade } from "./types";
+import { wilsonLower } from "./stats";
+import type { Coin, DevReport, HolderReport, PairMarket, Quote, SocialReport, Trade } from "./types";
 
 const PUMP = "https://frontend-api-v3.pump.fun";
 const SWAP = "https://swap-api.pump.fun";
@@ -253,6 +254,35 @@ export async function dsQuotes(addresses: string[]): Promise<Record<string, Quot
       mcapUsd: num(p.marketCap) || num(p.fdv),
       reserveTokens: num((p.liquidity as { base?: number } | undefined)?.base),
       reserveSol: num((p.liquidity as { quote?: number } | undefined)?.quote),
+      pairCreatedAt: num(p.pairCreatedAt) || null,
+    };
+  }
+  return out;
+}
+
+/** Activity metrics for up to 30 pairs per call (Pulse filters: volume, txns, buys, sells, liquidity, dex paid). */
+export async function dsMarket(pairs: string[]): Promise<Record<string, PairMarket>> {
+  if (!pairs.length) return {};
+  const json = await getJson<{ pairs?: Record<string, unknown>[] | null }>(
+    `https://api.dexscreener.com/latest/dex/pairs/solana/${pairs.slice(0, 30).join(",")}`,
+    { limit: 2 },
+  );
+  const out: Record<string, PairMarket> = {};
+  type Window = { m5?: number; h1?: number; h24?: number };
+  type Txns = { m5?: { buys?: number; sells?: number }; h1?: { buys?: number; sells?: number }; h24?: { buys?: number; sells?: number } };
+  for (const p of json.pairs ?? []) {
+    const v = (p.volume ?? {}) as Window;
+    const t = (p.txns ?? {}) as Txns;
+    const info = p.info as { imageUrl?: string; header?: string } | undefined;
+    out[String(p.pairAddress)] = {
+      at: Date.now(),
+      volumeUsd: { m5: num(v.m5), h1: num(v.h1), h24: num(v.h24) },
+      buys: { m5: num(t.m5?.buys), h1: num(t.h1?.buys), h24: num(t.h24?.buys) },
+      sells: { m5: num(t.m5?.sells), h1: num(t.h1?.sells), h24: num(t.h24?.sells) },
+      liquidityUsd: num((p.liquidity as { usd?: number } | undefined)?.usd),
+      mcapUsd: num(p.marketCap) || num(p.fdv),
+      // DexScreener shows a header/banner only for tokens whose profile was paid for ("Dex paid").
+      dexPaid: !!info?.header || num((p.boosts as { active?: number } | undefined)?.active) > 0,
     };
   }
   return out;
@@ -311,18 +341,22 @@ export async function devReport(coin: Coin): Promise<DevReport> {
   );
   const now = Date.now();
   const all = Array.isArray(json) ? json.filter((c) => c?.creator === coin.creator) : [];
-  const others = all.filter((c) => c.mint !== coin.mint);
+  // Only launches before this one; only resolved ones (old enough that the outcome is known) count toward quality.
+  const others = all.filter((c) => c.mint !== coin.mint && num(c.created_timestamp) < coin.createdAt);
+  const resolved = others.filter((c) => now - num(c.created_timestamp) >= CONFIG.developer.resolveAfterMs);
   const ath = (c: PumpCoin) => num(c.ath_market_cap) || num(c.usd_market_cap);
   const athSorted = others.map(ath).sort((a, b) => a - b);
-  const successes = others.filter((c) => c.complete || ath(c) >= 100_000).length;
+  const successes = resolved.filter((c) => c.complete || ath(c) >= 100_000).length;
   return {
     at: now,
     launches: others.length,
     capped: all.length >= 50,
     launches24h: others.filter((c) => now - num(c.created_timestamp) < 24 * 3600_000).length,
     graduated: others.filter((c) => c.complete).length,
+    resolved: resolved.length,
     successes,
-    successRate: others.length ? successes / others.length : 0,
+    successRate: resolved.length ? successes / resolved.length : 0,
+    successLowerBound: wilsonLower(successes, resolved.length),
     bestAthUsd: athSorted.at(-1) ?? 0,
     medianAthUsd: athSorted.length ? athSorted[athSorted.length >> 1] : 0,
     died: others.filter((c) => now - num(c.created_timestamp) > 3600_000 && ath(c) < 10_000).length,

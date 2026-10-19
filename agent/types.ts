@@ -21,6 +21,9 @@ export type Coin = {
   lastTradeAt: number;
   firstSeen: number;
   updatedAt: number;
+  /** When it migrated to PumpSwap: pool creation time if known, else when we observed the change. */
+  migratedAt?: number | null;
+  migratedAtSource?: "pool_created" | "observed" | null;
 };
 
 export type Trade = {
@@ -49,6 +52,21 @@ export type Quote = {
   /** Pool reserves (PumpSwap); 0 on the curve, where reserves follow from the price. */
   reserveTokens: number;
   reserveSol: number;
+  /** When this pair was created (for a PumpSwap pool: the migration time). */
+  pairCreatedAt?: number | null;
+};
+
+/** Pair activity from DexScreener (used by the Pulse list filters). */
+export type PairMarket = {
+  at: number;
+  volumeUsd: { m5: number; h1: number; h24: number };
+  buys: { m5: number; h1: number; h24: number };
+  sells: { m5: number; h1: number; h24: number };
+  liquidityUsd: number;
+  mcapUsd: number;
+  dexPaid: boolean;
+  /** DexScreener hasn't indexed this pair yet (all activity numbers are zero). */
+  missing?: boolean;
 };
 
 export type Holder = { owner: string; pct: number; insider: boolean };
@@ -174,10 +192,27 @@ export type Features = {
   liquidityUsd: number | null;
   tapeTrades: number;
   tapeFromLaunch: boolean;
+  /** Minutes of trade history we actually hold; highs/lows are measured over this window. */
+  observedMin: number;
+  /** "launch" when the tape reaches the first trade, else "observed" (the true ATH may be higher). */
+  highScope: "launch" | "observed";
+  /** Poll gaps where trades may have been missed (page had no overlap with what we held). */
+  tapeGaps: number;
+  /** Launch cohorts are trustworthy only with a launch tape and no gaps since. */
+  cohortsReliable: boolean;
+  /** Minutes since migration, or null if unknown (never inferred from creation time). */
+  migratedAgeMin: number | null;
+  /** Watched and discovered traders still holding, from the tape (a lower bound if the tape is partial). */
+  tracked: { watching: number; discovered: number; heldPct: number };
 };
 
 export type ScreenLevel = "veto" | "warn" | "ok" | "unknown";
-export type ScreenResult = { id: string; label: string; level: ScreenLevel; detail: string };
+/**
+ * verified = checked and fine · adverse = checked and bad · unknown = not observable or not yet checked ·
+ * stale = the report is too old to rely on (treated like unknown; it never passes as fine).
+ */
+export type EvidenceStatus = "verified" | "adverse" | "unknown" | "stale";
+export type ScreenResult = { id: string; label: string; level: ScreenLevel; detail: string; status?: EvidenceStatus; observedAt?: number | null };
 
 /** A creator's launch history on pump.fun (excluding the coin being judged). */
 export type DevReport = {
@@ -187,9 +222,13 @@ export type DevReport = {
   capped: boolean;
   launches24h: number;
   graduated: number;
-  /** Graduated, or reached a $100k ATH. */
+  /** Prior launches old enough for their outcome to be known (only these count toward quality). */
+  resolved: number;
+  /** Resolved launches that graduated or reached a $100k ATH. */
   successes: number;
   successRate: number;
+  /** Conservative (Wilson) lower bound on the success rate. */
+  successLowerBound: number;
   bestAthUsd: number;
   medianAthUsd: number;
   /** Older than an hour and never passed a $10k ATH. */
@@ -199,6 +238,10 @@ export type DevReport = {
 /** Top-holder wallet ages and funding sources. */
 export type FundingReport = {
   at: number;
+  /** When this report stops counting as current evidence. */
+  expiresAt?: number;
+  /** Top holders we tried to check, and how many lookups succeeded. */
+  requested?: number;
   checked: number;
   /** Wallets under a day old (or with almost no history). */
   fresh: number;
@@ -208,5 +251,18 @@ export type FundingReport = {
   topClusterPct: number;
   exchangeFunded: number;
   unknownFunder: number;
+  /** Funders identified only as a fee payer (weak evidence: not used to form clusters). */
+  payerOnly: number;
+  /** Funders backed by an actual SOL transfer (strong evidence). */
+  transferBacked?: number;
+  /** Share of supply in the holders we tried to check, in the ones we did check, and their ratio. */
+  requestedPct?: number;
+  checkedPct: number;
+  coverage?: number;
+  /** Supply whose funding is unresolved: weak (fee payer only), no funder found, or lookup failed. */
+  unresolvedPct: number;
+  /** Lookups that failed, with a category: a technical failure is not evidence against the token. */
+  failed?: { address: string; pct: number; category: "rate_limited" | "unsupported_transaction" | "history_unavailable" | "network" | "other"; error: string }[];
+  failureCounts?: Partial<Record<string, number>>;
   provider: "helius" | "public";
 };

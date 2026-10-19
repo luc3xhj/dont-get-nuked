@@ -34,11 +34,19 @@ export type Features = {
   repeatBuyShare: number;
   tapeTrades: number;
   tapeFromLaunch: boolean;
+  observedMin?: number;
+  /** "observed" when the tape doesn't reach launch: the ATH shown is the highest we saw, not the true ATH. */
+  highScope?: "launch" | "observed";
+  tapeGaps?: number;
+  cohortsReliable?: boolean;
+  migratedAgeMin?: number | null;
 };
 export type ScreenLevel = "veto" | "warn" | "ok" | "unknown";
-export type Screen = { id: string; label: string; level: ScreenLevel; detail: string };
+export type EvidenceStatus = "verified" | "adverse" | "unknown" | "stale";
+export type Screen = { id: string; label: string; level: ScreenLevel; detail: string; status?: EvidenceStatus; observedAt?: number | null };
 export type Check = { label: string; ok: boolean; value: string };
-export type SetupEval = { setup: string; status: "armed" | "fire"; structure: Check[]; trigger: Check[]; quality: number };
+export type SetupEpisode = { id: string; state: "armed" | "fired" | "cooldown"; armedAt: number; firedAt: number | null; cooldownUntil?: number };
+export type SetupEval = { setup: string; status: "armed" | "fire"; structure: Check[]; trigger: Check[]; quality: number; episode?: SetupEpisode };
 export type Analysis = {
   at: number;
   expiresAt: number;
@@ -83,8 +91,19 @@ export type WatchedCoin = {
   quote: Quote | null;
   curveProgress: number | null;
   social: Social;
-  dev?: { launches: number; capped: boolean; launches24h: number; graduated: number; successes: number; successRate: number; bestAthUsd: number; died: number } | null;
-  funding?: { checked: number; fresh: number; freshPct: number; clusters: { funder: string; wallets: string[]; pct: number }[]; topClusterPct: number; exchangeFunded: number } | null;
+  dev?: {
+    launches: number;
+    capped: boolean;
+    launches24h: number;
+    graduated: number;
+    resolved?: number;
+    successes: number;
+    successRate: number;
+    successLowerBound?: number;
+    bestAthUsd: number;
+    died: number;
+  } | null;
+  funding?: { checked: number; fresh: number; freshPct: number; clusters: { funder: string; wallets: string[]; pct: number }[]; topClusterPct: number; exchangeFunded: number; payerOnly?: number; unresolvedPct?: number } | null;
 };
 
 export type AgentState = {
@@ -124,6 +143,7 @@ export type CoinDetail =
       tracked: true;
       fills: Fill[];
       recentTrades: TapeTrade[];
+      traders?: TraderOnCoin[];
       holdersReport: { top: { owner: string; pct: number; insider: boolean }[]; totalHolders: number | null } | null;
     })
   | {
@@ -212,13 +232,20 @@ export type Decision = {
   analyst: { verdict: string; conviction: number; note: string };
   regime?: { level: string; reasons: string[] };
   reasons: string[];
+  version?: string;
+  /** Net economics at the exact size taken (null on a pass). */
+  costs?: { sizeSol: number; entryImpact: number; tp1NetSol: number; stopNetSol: number; netRewardRisk: number; roundTripCostPct: number } | null;
+  essentials?: { id: string; label: string; ok: boolean; detail: string }[];
 };
 export type PortfolioReport = {
   accounts: Account[];
   open: OpenPosition[];
-  pending: { account: AccountId; mint: string; side: string; reason: string; ageMs: number }[];
+  pending: { account: AccountId; mint: string; side: string; reason: string; ageMs: number; waiting?: boolean }[];
   closed: ClosedTrade[];
   decisions: Decision[];
+  strategyVersion?: string;
+  evidenceVersions?: string[];
+  researchCoverage?: { version: string; decisions: number; withValidReport: number; share: number; medianAgeMin: number | null };
 };
 
 export type ActivityItem = {
@@ -226,7 +253,7 @@ export type ActivityItem = {
   ts: number;
   mint: string | null;
   symbol: string | null;
-  tone: "buy" | "sell" | "win" | "loss" | "setup" | "pass" | "analyst" | "system";
+  tone: "buy" | "sell" | "win" | "loss" | "setup" | "pass" | "analyst" | "system" | "trader";
   title: string;
   detail: string;
 };
@@ -261,3 +288,156 @@ export const coinImage = (mint: string) => `https://images.pump.fun/coin-image/$
 
 export const solSigned = (v: number, d = 3) => `${v >= 0 ? "+" : ""}${v.toFixed(d)}◎`;
 export const pctSigned = (v: number, d = 0) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(d)}%`;
+
+/** A watched or discovered wallet's position in one coin, computed from the tape. */
+export type TraderOnCoin = {
+  address: string;
+  name: string | null;
+  xHandle: string | null;
+  source: "watching" | "discovered";
+  firstBuyAt: number;
+  entryMcapUsd: number | null;
+  multiple: number | null;
+  holdingPct: number;
+  solIn: number;
+  solOut: number;
+  pnlSol: number | null;
+  lastAction: "buy" | "sell";
+  lastActionAt: number;
+  complete: boolean;
+  actions: { ts: number; side: "buy" | "sell"; sol: number }[];
+};
+
+export type DiscoveredWallet = {
+  address: string;
+  closed: number;
+  wins: number;
+  winRateLower: number;
+  realizedSol: number;
+  returnOnCost?: number;
+  avgHoldMin?: number;
+  coins: number;
+  lastActiveAt: number;
+  score: number;
+};
+
+export type TradersReport = {
+  discovery: { minClosed: number; ranked: number; top: number };
+  watching: {
+    address: string;
+    name: string;
+    xHandle: string | null;
+    note: string;
+    addedAt: number;
+    coinsSeen: number;
+    lastActiveAt: number | null;
+    lastMint: string | null;
+    discovered: DiscoveredWallet | null;
+  }[];
+  discovered: (DiscoveredWallet & { watching: boolean })[];
+};
+
+export const shortAddr = (a: string) => `${a.slice(0, 4)}…${a.slice(-4)}`;
+
+// ---------- Pulse (Axiom-style coin list) ----------
+
+export type PulseRange = { min: number | null; max: number | null };
+export type PulseRangeKey =
+  | "age"
+  | "top10Holders"
+  | "devHolding"
+  | "snipers"
+  | "insiders"
+  | "bundle"
+  | "holders"
+  | "bondingCurve"
+  | "liquidity"
+  | "volume"
+  | "marketCap"
+  | "txns"
+  | "numBuys"
+  | "numSells";
+export type PulseFlagKey = "twitter" | "website" | "telegram" | "dexPaid" | "anySocial";
+export type PulseFilters = Record<PulseRangeKey, PulseRange> & Record<PulseFlagKey, boolean> & { searchKeywords: string[]; excludeKeywords: string[] };
+export type PulseMetrics = {
+  ageMin: number;
+  marketCap: number | null;
+  bondingCurve: number | null;
+  athMcap: number | null;
+  liquidity: number | null;
+  volume: number | null;
+  txns: number | null;
+  numBuys: number | null;
+  numSells: number | null;
+  holders: number | null;
+  top10Holders: number | null;
+  devHolding: number | null;
+  insiders: number | null;
+  snipers: number | null;
+  bundle: number | null;
+  dexPaid: boolean | null;
+  twitter: boolean;
+  website: boolean;
+  telegram: boolean;
+};
+export type PulseColumnId = "newPairs" | "finalStretch" | "migrated";
+export type PulseCoin = {
+  mint: string;
+  symbol: string;
+  name: string;
+  createdAt: number;
+  hot: boolean;
+  status: "pass" | "checking";
+  failed: string[];
+  unknown: string[];
+  metrics: PulseMetrics;
+};
+export type PulseColumn = {
+  id: PulseColumnId;
+  label: string;
+  filters: PulseFilters;
+  preset: PulseFilters;
+  counts: { seen: number; pass: number; checking: number; fail: number };
+  failReasons: Record<string, number>;
+  coins: PulseCoin[];
+};
+export type PulseReport = { at: number; note: string; labels: Record<string, string>; columns: PulseColumn[] };
+
+// ---------- Decision funnel ----------
+
+export type FunnelCandidate = {
+  mint: string;
+  symbol: string;
+  setup: string;
+  stage: "armed" | "fired" | "blocked" | "passed";
+  episode: SetupEpisode | null;
+  held: boolean;
+  waitingOn: string[];
+  primaryBlocker: string | null;
+  blockers: string[];
+  blockerCategory: string | null;
+  nextAction: string;
+  research: { verdict: string; validForMin: number; effect: string | null } | null;
+  decidedAt: number | null;
+};
+export type FunnelReport = {
+  version: string;
+  hours: number;
+  /** Counting starts at the later of the window start and this strategy version's start. */
+  since: number;
+  stages: { id: string; label: string; n: number }[];
+  blockers: { id: string; label: string; primary: number; any: number }[];
+  researchEffects: Record<string, number>;
+  researchAtDecision: { decisions: number; withValidReport: number };
+  technical: {
+    fundingReportsFailed: number;
+    fundingReportsPartial: number;
+    fundingLookupFailures: Record<string, number>;
+    analysisErrors: number;
+    lateAnalyses: number;
+    fillsFailed: number;
+    ordersExpired: number;
+    exitsWaitingForPrice: number;
+  };
+  candidates: FunnelCandidate[];
+};

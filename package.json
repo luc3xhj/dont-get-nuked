@@ -12,6 +12,7 @@
     "agent": "node --env-file-if-exists=.env.local --import tsx agent/main.ts",
     "agent:install": "node scripts/agent-service.mjs install",
     "agent:start": "node scripts/agent-service.mjs start",
+    "replay:decisions": "node --import tsx agent/replay-decisions.ts",
     "agent:stop": "node scripts/agent-service.mjs stop",
     "agent:status": "node scripts/agent-service.mjs status",
     "agent:uninstall": "node scripts/agent-service.mjs uninstall"

@@ -3,15 +3,17 @@
 //   shadow   — takes EVERY setup that fires at a fixed size: measures each setup's raw edge
 //   baseline — whenever shadow enters, enters a RANDOM other hot coin with the same plan shape:
 //              if setups can't beat this, we have no edge
+import { NETWORK_FEE_SOL } from "../src/lib/amm";
+import { CONFIG } from "./config";
 import { db, journal } from "./db";
-import { fillBuy, fillSell, latency, liquidationValue, maxSizeForImpact, roundTripCost } from "./execution";
+import { decideFrom, POST_TP1_STOP, TP1_FRACTION, type DecisionResult, type DecisionSnapshot } from "./decision";
+import { EXEC, fillBuy, fillSell, latency, liquidationValue, poolOf } from "./execution";
+import { essentialsFor } from "./requirements";
 import { SETUP_LABEL, type Plan, type SetupEval, type SetupId } from "./setups";
 import type { Analysis } from "./analyst";
 import { regime } from "./regime";
-import { verdict } from "./screens";
 import { coins, type CoinState } from "./state";
-import { analysisKey, compareAnalysis } from "./analysis-impact";
-import type { AnalysisImpact } from "../src/lib/research-types";
+import { analysisKey } from "./analysis-impact";
 
 export type AccountId = "agent" | "shadow" | "baseline";
 
@@ -40,6 +42,8 @@ export const RISK = {
   minEdgeR: 0.05,
   /** Assume stops gap this much past the stop price in a fast market. */
   stopGap: 1.2,
+  /** Open positions (incl. pending buys) allowed per developer: their coins tend to move together. */
+  maxPerCreator: 1,
   trailPct: 0.25,
 };
 
@@ -80,6 +84,9 @@ export type Position = {
   exitAnalysisId?: string | null;
   evidence: string[];
   exiting: boolean;
+  creator?: string;
+  /** Strategy version that opened the position. */
+  version?: string;
 };
 
 export type Closed = {
@@ -102,6 +109,7 @@ export type Closed = {
   entryAnalysisId?: string | null;
   entryDecisionId?: string;
   exitAnalysisId?: string | null;
+  version?: string;
 };
 
 type Order = {
@@ -123,6 +131,13 @@ type Order = {
   setup?: SetupId | "random";
   plan?: Plan;
   evidence?: string[];
+  version?: string;
+  /** Uniform draws fixed when the order is placed (latency, failure), so a recorded order replays identically. */
+  draws?: { latency: number; fail: number };
+  /** Set once a sell has waited past the timeout without a fresh price (journaled once). */
+  waitingSince?: number;
+  /** A TP1 sell: the position only counts TP1 as done (and moves its stop) once this fills. */
+  kind?: "tp1";
 };
 
 // ---------- persistence ----------
@@ -133,6 +148,9 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS closed (id TEXT PRIMARY KEY, account TEXT NOT NULL, setup TEXT NOT NULL, closed_at INTEGER NOT NULL, data TEXT NOT NULL);
   CREATE INDEX IF NOT EXISTS closed_account ON closed (account, closed_at);
   CREATE TABLE IF NOT EXISTS equity (account TEXT NOT NULL, ts INTEGER NOT NULL, equity REAL NOT NULL, PRIMARY KEY (account, ts)) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY, at INTEGER NOT NULL, mint TEXT NOT NULL, version TEXT NOT NULL, snapshot TEXT NOT NULL, result TEXT NOT NULL);
+  CREATE INDEX IF NOT EXISTS decisions_at ON decisions (at);
 `);
 
 const dayKey = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
@@ -149,6 +167,28 @@ const saveAccount = (a: Account) => db.prepare("INSERT OR REPLACE INTO accounts 
 const savePosition = (p: Position) =>
   db.prepare("INSERT OR REPLACE INTO positions (id, account, data) VALUES (?, ?, ?)").run(p.id, p.account, JSON.stringify(p));
 const deletePosition = (id: string) => db.prepare("DELETE FROM positions WHERE id = ?").run(id);
+const saveOrder = (o: Order) => db.prepare("INSERT OR REPLACE INTO orders (id, data) VALUES (?, ?)").run(o.id, JSON.stringify(o));
+const deleteOrder = (id: string) => db.prepare("DELETE FROM orders WHERE id = ?").run(id);
+function addOrder(o: Order) {
+  orders.push(o);
+  saveOrder(o);
+}
+function removeOrder(i: number) {
+  deleteOrder(orders[i].id);
+  orders.splice(i, 1);
+}
+
+/** Apply one fill's account, position and journal writes together, or not at all. */
+function atomically(fn: () => void) {
+  db.exec("BEGIN");
+  try {
+    fn();
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
 
 export function restorePortfolio() {
   for (const row of db.prepare("SELECT data FROM accounts").all() as { data: string }[]) {
@@ -170,9 +210,12 @@ export function restorePortfolio() {
       accounts.set(id, a);
       saveAccount(a);
     }
+  // Orders survive restarts: buys past their timeout expire on the next tick, sells keep waiting for a price.
+  orders.length = 0;
+  for (const row of db.prepare("SELECT data FROM orders").all() as { data: string }[]) orders.push(JSON.parse(row.data) as Order);
   for (const row of db.prepare("SELECT data FROM positions").all() as { data: string }[]) {
     const p = JSON.parse(row.data) as Position;
-    p.exiting = false;
+    p.exiting = orders.some((o) => o.side === "sell" && o.positionId === p.id);
     positions.set(p.id, p);
   }
 }
@@ -231,12 +274,13 @@ function riskGate(a: Account): string | null {
 
 /**
  * What the shadow book has learned about a setup: trades, win rate, and average R after all costs,
- * shrunk toward zero while the sample is small.
+ * shrunk toward zero while the sample is small. Only trades from strategy versions listed in
+ * CONFIG.evidenceVersions count, so a rule change doesn't inherit evidence from different rules.
  */
-export function setupEvidence(setup: SetupId) {
-  const rows = (db.prepare("SELECT data FROM closed WHERE account = 'shadow' AND setup = ?").all(setup) as { data: string }[]).map(
-    (r) => JSON.parse(r.data) as Closed,
-  );
+export function setupEvidence(setup: SetupId, versions: string[] = CONFIG.evidenceVersions) {
+  const rows = (db.prepare("SELECT data FROM closed WHERE account = 'shadow' AND setup = ?").all(setup) as { data: string }[])
+    .map((r) => JSON.parse(r.data) as Closed)
+    .filter((c) => c.version && versions.includes(c.version));
   const n = rows.length;
   const avgR = n ? rows.reduce((s, r) => s + r.r, 0) / n : 0;
   return {
@@ -244,6 +288,7 @@ export function setupEvidence(setup: SetupId) {
     winRate: n ? rows.filter((r) => r.pnlSol > 0).length / n : 0,
     avgR,
     shrunkR: (avgR * n) / (n + RISK.priorWeight),
+    versions,
   };
 }
 
@@ -255,8 +300,11 @@ const uid = () => crypto.randomUUID();
 const openFor = (account: AccountId, mint: string) => [...positions.values()].some((p) => p.account === account && p.mint === mint);
 const pendingFor = (account: AccountId, mint: string) => orders.some((o) => o.account === account && o.mint === mint);
 
+const newDraws = () => ({ latency: Math.random(), fail: Math.random() });
+
 function placeBuy(account: AccountId, s: CoinState, solIn: number, setup: SetupId | "random", plan: Plan, evidence: string[], reason: string, decision?: Decision) {
   const now = Date.now();
+  const draws = newDraws();
   const o: Order = {
     id: uid(),
     decisionId: decision?.id,
@@ -266,96 +314,82 @@ function placeBuy(account: AccountId, s: CoinState, solIn: number, setup: SetupI
     mint: s.coin.mint,
     side: "buy",
     createdAt: now,
-    notBefore: now + latency(),
+    notBefore: now + latency(draws.latency),
     decisionPriceSol: plan.entrySol,
     solIn,
     setup,
     plan,
     evidence,
     reason,
+    version: CONFIG.strategyVersion,
+    draws,
   };
-  orders.push(o);
-  journal("order", s.coin.mint, { id: o.id, decisionId: o.decisionId, analysisId: o.analysisId, account, side: "buy", solIn, setup, plan, reason });
+  addOrder(o);
+  journal("order", s.coin.mint, { id: o.id, decisionId: o.decisionId, analysisId: o.analysisId, account, side: "buy", solIn, setup, plan, reason, version: o.version });
 }
 
-export type Decision = {
-  id: string;
-  impact: AnalysisImpact;
-  take: boolean;
-  sizeSol: number;
-  reasons: string[];
-  ev: number;
-  p: number;
-  mode: "explore" | "evidence";
-  n: number;
-  analyst: { verdict: Analysis["verdict"] | "none"; conviction: number; note: string };
-  regime: { level: string; reasons: string[] };
-};
+export type Decision = { id: string; version: string } & DecisionResult;
 
-/** The agent's judgment on a fired setup. Every reason is journaled for calibration. */
-export function decide(s: CoinState, ev: SetupEval): Decision {
+const creatorOf = (mint: string) => coins.get(mint)?.coin.creator;
+/** The analysis as recorded in a snapshot: everything the decision reads, without the bulky research bundle. */
+const snapshotAnalysis = (a: Analysis | null): Analysis | null => (a ? { ...a, research: undefined } : null);
+
+/** Everything the agent's decision depends on, frozen at decision time (replayable with decideFrom). */
+export function buildSnapshot(s: CoinState, ev: SetupEval, now = Date.now()): DecisionSnapshot {
   const a = accounts.get("agent")!;
-  const now = Date.now();
-  const reasons: string[] = [];
-  const plan = ev.plan!;
-  const risk = (plan.entrySol - plan.stopSol) / plan.entrySol;
-  const evd = setupEvidence(ev.setup);
-  const mode = evd.n < RISK.minEvidence ? "explore" : "evidence";
   const { equity } = equityOf("agent");
-
-  const gate = riskGate(a);
-  if (gate) reasons.push(gate);
-  if (verdict(s.screens) === "veto")
-    reasons.push(
-      `Screen veto: ${s.screens
-        .filter((x) => x.level === "veto")
-        .map((x) => x.label)
-        .join(", ")}`,
-    );
-  const warns = s.screens.filter((x) => x.level === "warn");
-  if (warns.length > RISK.maxWarnings) reasons.push(`${warns.length} screen warnings: ${warns.map((x) => x.label).join(", ")}`);
-  if (openFor("agent", s.coin.mint) || pendingFor("agent", s.coin.mint)) reasons.push("Already in this coin");
-  if (Date.now() - (lastExit.get(`agent:${s.coin.mint}`) ?? 0) < RISK.reentryCooldownMs) reasons.push("Re-entry cooldown");
-  const open =
-    [...positions.values()].filter((x) => x.account === "agent").length + orders.filter((o) => o.account === "agent" && o.side === "buy").length;
-  if (open >= RISK.maxOpen) reasons.push(`${open} positions open (max ${RISK.maxOpen})`);
-
-  // Size from risk: lose ~riskPerTrade of equity if the stop is hit (with gap) and costs are paid.
-  // The analyst's slow-lane judgment: a reject blocks, conviction scales size, no verdict trades half size.
-  const an = freshAnalysis(s, now);
-  const analyst = an
-    ? { verdict: an.verdict, conviction: an.conviction, note: an.verdict === "reject" ? (an.redFlags[0] ?? an.thesis) : an.narrative }
-    : { verdict: "none" as const, conviction: RISK.noAnalysisScale, note: "No fresh analyst verdict" };
-  // Market regime: don't trade into a bad tape; half size when it's shaky.
-  if (regime.level === "bad") reasons.push(`Market regime bad: ${regime.reasons.join("; ")}`);
-  const regimeScale = regime.level === "caution" ? 0.5 : 1;
-  const cost = roundTripCost(s, 0.5);
-  const sizeCap = Math.min(equity * RISK.maxPositionFraction, maxSizeForImpact(s, RISK.maxImpact), a.cash * 0.95);
-  const sizeFor = (conviction: number) => Math.min(
-    (equity * RISK.riskPerTrade * (mode === "explore" ? RISK.explorationRiskScale : 1) * conviction * regimeScale) / (risk * RISK.stopGap + cost),
-    sizeCap,
-  );
-
-  // Realized shadow R already includes every cost; until there is enough of it, explore small.
-  const evFrac = evd.shrunkR * risk;
-  if (mode === "evidence" && evd.shrunkR < RISK.minEdgeR)
-    reasons.push(`No edge yet: shadow avg ${evd.avgR.toFixed(2)}R over ${evd.n} trades (${(evd.winRate * 100).toFixed(0)}% wins)`);
-
-  const { actual, impact } = compareAnalysis({
-    mint: s.coin.mint, analysis: s.analysis, now, commonReasons: reasons, sizeFor,
-    defaultScale: RISK.noAnalysisScale, minimum: RISK.minOrderSol,
-  });
+  const agentPositions = [...positions.values()].filter((x) => x.account === "agent");
+  const agentBuys = orders.filter((o) => o.account === "agent" && o.side === "buy");
+  const creator = s.coin.creator;
+  const sameCreatorOpen =
+    agentPositions.filter((p) => p.mint !== s.coin.mint && (p.creator ?? creatorOf(p.mint)) === creator).length +
+    agentBuys.filter((o) => o.mint !== s.coin.mint && creatorOf(o.mint) === creator).length;
+  const evd = setupEvidence(ev.setup);
   return {
-    id: uid(),
-    impact,
-    ...actual,
-    ev: evFrac,
-    p: evd.winRate,
-    mode,
-    n: evd.n,
-    analyst,
-    regime: { level: regime.level, reasons: regime.reasons },
+    strategyVersion: CONFIG.strategyVersion,
+    at: now,
+    mint: s.coin.mint,
+    symbol: s.coin.symbol,
+    creator,
+    setup: ev.setup,
+    plan: ev.plan!,
+    screens: s.screens.map((x) => ({ id: x.id, label: x.label, level: x.level, status: x.status })),
+    essentials: essentialsFor(s, ev.setup, now),
+    essentialsWithoutAnalysis: essentialsFor({ ...s, analysis: null }, ev.setup, now),
+    evidence: evd,
+    account: {
+      equity,
+      cash: a.cash,
+      open: agentPositions.length + agentBuys.length,
+      gate: riskGate(a),
+      busy: openFor("agent", s.coin.mint) || pendingFor("agent", s.coin.mint),
+      reentry: now - (lastExit.get(`agent:${s.coin.mint}`) ?? 0) < RISK.reentryCooldownMs,
+      sameCreatorOpen: sameCreatorOpen >= RISK.maxPerCreator ? sameCreatorOpen : 0,
+    },
+    regime: { level: regime.level, reasons: [...regime.reasons] },
+    analysis: snapshotAnalysis(s.analysis),
+    pool: poolOf(s),
+    exec: { adverseSlippage: EXEC.adverseSlippage, networkFeeSol: NETWORK_FEE_SOL, maxImpact: RISK.maxImpact, stopGap: RISK.stopGap },
+    risk: {
+      riskPerTrade: RISK.riskPerTrade,
+      maxPositionFraction: RISK.maxPositionFraction,
+      minOrderSol: RISK.minOrderSol,
+      maxOpen: RISK.maxOpen,
+      maxWarnings: RISK.maxWarnings,
+      minEvidence: RISK.minEvidence,
+      explorationRiskScale: RISK.explorationRiskScale,
+      noAnalysisScale: RISK.noAnalysisScale,
+      minEdgeR: RISK.minEdgeR,
+      minNetRewardRisk: CONFIG.decision.minNetRewardRisk,
+      sizingIterations: CONFIG.decision.sizingIterations,
+    },
   };
+}
+
+/** The agent's judgment on a fired setup: a pure function of the recorded snapshot. */
+export function decide(s: CoinState, ev: SetupEval): Decision & { snapshot: DecisionSnapshot } {
+  const snapshot = buildSnapshot(s, ev);
+  return { id: uid(), version: snapshot.strategyVersion, ...decideFrom(snapshot), snapshot };
 }
 
 /** Called each evaluation with a coin's fired setups. */
@@ -385,9 +419,17 @@ export function onSignals(s: CoinState, fired: SetupEval[]) {
     // Agent: its own judgment, re-asked at most once a minute per coin+setup.
     if (!openFor("agent", s.coin.mint) && !pendingFor("agent", s.coin.mint) && now - (lastDecision.get(key) ?? 0) > 60_000) {
       lastDecision.set(key, now);
-      const d = decide(s, ev);
-      journal("decision", s.coin.mint, { setup: ev.setup, ...d });
-      recentDecisions.unshift({ at: now, mint: s.coin.mint, symbol: s.coin.symbol, setup: ev.setup, ...d });
+      const { snapshot, ...d } = decide(s, ev);
+      db.prepare("INSERT OR REPLACE INTO decisions (id, at, mint, version, snapshot, result) VALUES (?, ?, ?, ?, ?, ?)").run(
+        d.id,
+        snapshot.at,
+        s.coin.mint,
+        d.version,
+        JSON.stringify(snapshot),
+        JSON.stringify(d),
+      );
+      journal("decision", s.coin.mint, { setup: ev.setup, ...d, essentials: snapshot.essentials });
+      recentDecisions.unshift({ at: now, mint: s.coin.mint, symbol: s.coin.symbol, setup: ev.setup, ...d, essentials: snapshot.essentials });
       recentDecisions.length = Math.min(recentDecisions.length, 100);
       if (d.take)
         placeBuy(
@@ -404,7 +446,7 @@ export function onSignals(s: CoinState, fired: SetupEval[]) {
   }
 }
 
-export const recentDecisions: ({ at: number; mint: string; symbol: string; setup: SetupId } & Decision)[] = [];
+export const recentDecisions: ({ at: number; mint: string; symbol: string; setup: SetupId; essentials?: DecisionSnapshot["essentials"] } & Decision)[] = [];
 
 /** Control: same size, timing and plan shape as the shadow entry, on a random other hot coin. */
 function openBaseline(trigger: CoinState, shape: Plan) {
@@ -446,6 +488,7 @@ function closePosition(p: Position, reason: string) {
     entryAnalysisId: p.entryAnalysisId,
     entryDecisionId: p.entryDecisionId,
     exitAnalysisId: p.exitAnalysisId,
+    version: p.version,
   };
   db.prepare("INSERT OR REPLACE INTO closed (id, account, setup, closed_at, data) VALUES (?, ?, ?, ?, ?)").run(
     c.id,
@@ -463,36 +506,42 @@ function closePosition(p: Position, reason: string) {
   journal("close", p.mint, c);
 }
 
+const drawsOf = (o: Order) => o.draws ?? { latency: 0.5, fail: 1 };
+
 function processOrders() {
   const now = Date.now();
   for (let i = orders.length - 1; i >= 0; i--) {
     const o = orders[i];
     const s = coins.get(o.mint);
     const a = accounts.get(o.account)!;
-    const expired = now - o.createdAt > 30_000;
+    const expired = now - o.createdAt > EXEC.orderTimeoutMs;
     if (!s) {
-      orders.splice(i, 1);
-      journal("order_expired", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: o.side, reason: "Coin no longer tracked" });
+      if (o.side === "sell") continue; // a held coin stays tracked; keep the exit until it can be priced
+      atomically(() => {
+        removeOrder(i);
+        journal("order_expired", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: o.side, reason: "Coin no longer tracked" });
+      });
       continue;
     }
     if (o.side === "buy") {
-      const fill = fillBuy(s, o.solIn!, o.decisionPriceSol, o.notBefore);
+      const fill = fillBuy(s, o.solIn!, o.decisionPriceSol, o.notBefore, drawsOf(o).fail);
       if (fill === "wait") {
-        if (expired) {
-          orders.splice(i, 1);
-          journal("order_expired", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy" });
-        }
+        if (expired)
+          atomically(() => {
+            removeOrder(i);
+            journal("order_expired", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy" });
+          });
         continue;
       }
-      orders.splice(i, 1);
       if (!fill.ok) {
-        a.cash -= fill.feeSol;
-        saveAccount(a);
-        journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy", reason: fill.reason });
+        atomically(() => {
+          removeOrder(i);
+          a.cash -= fill.feeSol;
+          saveAccount(a);
+          journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "buy", reason: fill.reason });
+        });
         continue;
       }
-      a.cash -= fill.sol;
-      saveAccount(a);
       const p: Position = {
         id: uid(),
         account: o.account,
@@ -517,55 +566,80 @@ function processOrders() {
         entryDecisionId: o.decisionId,
         evidence: o.evidence ?? [],
         exiting: false,
+        creator: s.coin.creator,
+        version: o.version,
       };
-      positions.set(p.id, p);
-      savePosition(p);
-      journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "buy", sol: fill.sol, tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact });
+      atomically(() => {
+        removeOrder(i);
+        a.cash -= fill.sol;
+        saveAccount(a);
+        positions.set(p.id, p);
+        savePosition(p);
+        journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "buy", sol: fill.sol, tokens: fill.tokens, priceSol: fill.priceSol, impact: fill.impact });
+      });
     } else {
       const p = positions.get(o.positionId!);
       if (!p) {
-        orders.splice(i, 1);
+        removeOrder(i);
         continue;
       }
       const tokensIn = Math.min(o.tokensIn!, p.tokens);
-      const fill = fillSell(s, tokensIn, o.notBefore);
+      const fill = fillSell(s, tokensIn, o.notBefore, drawsOf(o).fail);
       if (fill === "wait") {
-        if (expired && now - (s.quote?.at ?? 0) > 5 * 60_000) {
-          // No price for 5 minutes: treat as untradeable and write it off rather than inventing a fill.
-          orders.splice(i, 1);
-          p.tokens = 0;
-          p.exitAnalysisId = o.analysisId;
-          closePosition(p, `${o.reason} (no price — written off)`);
-          journal("order_expired", o.mint, { orderId: o.id, account: o.account, side: "sell", reason: "No price; position written off without a fill" });
+        // No fresh price: the position stays open (valued at zero) and the exit keeps waiting. Nothing is invented.
+        if (expired && !o.waitingSince) {
+          o.waitingSince = now;
+          saveOrder(o);
+          journal("exit_waiting", o.mint, { orderId: o.id, positionId: p.id, account: o.account, reason: o.reason, lastQuoteAt: s.quote?.at ?? null });
         }
         continue;
       }
-      orders.splice(i, 1);
       if (!fill.ok) {
-        a.cash -= fill.feeSol;
-        p.exiting = false; // retry on the next tick
-        saveAccount(a);
-        journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "sell", reason: fill.reason });
+        atomically(() => {
+          removeOrder(i);
+          a.cash -= fill.feeSol;
+          p.exiting = false; // retry on the next tick
+          saveAccount(a);
+          journal("fill_failed", o.mint, { orderId: o.id, decisionId: o.decisionId, account: o.account, side: "sell", reason: fill.reason });
+        });
         continue;
       }
-      a.cash += fill.sol;
-      p.proceedsSol += fill.sol;
-      p.tokens -= tokensIn;
-      p.exiting = false;
-      saveAccount(a);
-      journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "sell", sol: fill.sol, tokens: tokensIn, priceSol: fill.priceSol, reason: o.reason });
-      if (p.tokens <= p.initialTokens * 1e-6) { p.exitAnalysisId = o.analysisId; closePosition(p, o.reason); }
-      else savePosition(p);
+      atomically(() => {
+        removeOrder(i);
+        a.cash += fill.sol;
+        p.proceedsSol += fill.sol;
+        p.tokens -= tokensIn;
+        p.exiting = false;
+        if (o.kind === "tp1") {
+          // Only a confirmed TP1 fill locks in: stop to breakeven plus costs, then trail.
+          p.tp1Done = true;
+          p.stopSol = Math.max(p.stopSol, p.entryPriceSol * POST_TP1_STOP);
+        }
+        saveAccount(a);
+        journal("fill", o.mint, { orderId: o.id, decisionId: o.decisionId, analysisId: o.analysisId, positionId: p.id, account: o.account, side: "sell", sol: fill.sol, tokens: tokensIn, priceSol: fill.priceSol, reason: o.reason });
+        if (p.tokens <= p.initialTokens * 1e-6) {
+          p.exitAnalysisId = o.analysisId;
+          closePosition(p, o.reason);
+        } else savePosition(p);
+      });
     }
   }
 }
 
-function placeSell(p: Position, fraction: number, reason: string, analysisId: string | null = null, withoutExitReason: string | null = null) {
+function placeSell(
+  p: Position,
+  fraction: number,
+  reason: string,
+  analysisId: string | null = null,
+  withoutExitReason: string | null = null,
+  kind?: Order["kind"],
+) {
   const now = Date.now();
   p.exiting = true;
   const decisionId = uid();
   const orderId = uid();
-  orders.push({
+  const draws = newDraws();
+  addOrder({
     id: orderId,
     decisionId,
     analysisId,
@@ -573,11 +647,14 @@ function placeSell(p: Position, fraction: number, reason: string, analysisId: st
     mint: p.mint,
     side: "sell",
     createdAt: now,
-    notBefore: now + latency(),
+    notBefore: now + latency(draws.latency),
     decisionPriceSol: p.entryPriceSol,
     tokensIn: fraction >= 0.999 ? p.tokens : p.tokens * fraction,
     positionId: p.id,
     reason,
+    version: p.version,
+    draws,
+    kind,
   });
   journal("order", p.mint, { id: orderId, decisionId, analysisId, positionId: p.id, account: p.account, side: "sell", reason });
   if (analysisId) journal("exit_decision", p.mint, {
@@ -598,13 +675,8 @@ function manage(p: Position) {
   p.highSol = Math.max(p.highSol, price);
 
   if (price <= p.stopSol) return placeSell(p, 1, p.tp1Done ? "Trailing stop" : "Stop loss");
-  if (!p.tp1Done && price >= p.plan.tp1Sol) {
-    p.tp1Done = true;
-    // Lock in: stop to breakeven plus costs, then trail.
-    p.stopSol = Math.max(p.stopSol, p.entryPriceSol * 1.04);
-    savePosition(p);
-    return placeSell(p, 0.5, "Take profit 1 (half)");
-  }
+  // TP1 counts as done only when this sell fills (a failed sell is retried on the next tick).
+  if (!p.tp1Done && price >= p.plan.tp1Sol) return placeSell(p, TP1_FRACTION, "Take profit 1 (half)", null, null, "tp1");
   if (p.tp1Done) {
     const trail = p.highSol * (1 - RISK.trailPct);
     if (trail > p.stopSol) {
@@ -666,6 +738,26 @@ function statsOf(rows: Closed[]) {
   };
 }
 
+/**
+ * Research coverage (roadmap B9): of the agent's decisions under the current strategy version, how many
+ * had a valid analyst report at decision time, and how old it was.
+ */
+export function researchCoverage(version = CONFIG.strategyVersion) {
+  const rows = db
+    .prepare(
+      "SELECT at, json_extract(snapshot, '$.analysis.at') AS aAt, json_extract(snapshot, '$.analysis.expiresAt') AS aExp FROM decisions WHERE version = ?",
+    )
+    .all(version) as { at: number; aAt: number | null; aExp: number | null }[];
+  const ages = rows.filter((r) => r.aAt != null && r.aExp != null && r.aExp > r.at).map((r) => (r.at - r.aAt!) / 60_000).sort((a, b) => a - b);
+  return {
+    version,
+    decisions: rows.length,
+    withValidReport: ages.length,
+    share: rows.length ? ages.length / rows.length : 0,
+    medianAgeMin: ages.length ? ages[ages.length >> 1] : null,
+  };
+}
+
 export function portfolioReport() {
   const closed = (db.prepare("SELECT data FROM closed ORDER BY closed_at DESC").all() as { data: string }[]).map((r) => JSON.parse(r.data) as Closed);
   const accountsOut = IDS.map((id) => {
@@ -707,10 +799,13 @@ export function portfolioReport() {
   return {
     accounts: accountsOut,
     open,
-    pending: orders.map((o) => ({ account: o.account, mint: o.mint, side: o.side, reason: o.reason, ageMs: Date.now() - o.createdAt })),
+    pending: orders.map((o) => ({ account: o.account, mint: o.mint, side: o.side, reason: o.reason, ageMs: Date.now() - o.createdAt, waiting: !!o.waitingSince })),
     closed: closed.slice(0, 100),
     decisions: recentDecisions.slice(0, 50),
     risk: RISK,
+    strategyVersion: CONFIG.strategyVersion,
+    evidenceVersions: CONFIG.evidenceVersions,
+    researchCoverage: researchCoverage(),
   };
 }
 

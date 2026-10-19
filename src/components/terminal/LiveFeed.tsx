@@ -14,6 +14,7 @@ const TONE: Record<ActivityItem["tone"], { dot: string; title: string; icon: str
   pass: { dot: "text-zinc-600", title: "text-zinc-400", icon: "·" },
   analyst: { dot: "text-amber-400", title: "text-amber-200", icon: "✦" },
   system: { dot: "text-zinc-500", title: "text-zinc-400", icon: "•" },
+  trader: { dot: "text-amber-300", title: "text-amber-100", icon: "◉" },
 };
 
 const FILTERS: { id: FeedFilter; label: string; tones: ActivityItem["tone"][] | null }[] = [
@@ -22,6 +23,7 @@ const FILTERS: { id: FeedFilter; label: string; tones: ActivityItem["tone"][] | 
   { id: "decisions", label: "Decisions", tones: ["buy", "pass"] },
   { id: "setups", label: "Setups", tones: ["setup"] },
   { id: "research", label: "Research", tones: ["analyst"] },
+  { id: "traders", label: "Traders", tones: ["trader"] },
 ];
 
 const clock = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });

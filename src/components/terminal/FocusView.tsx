@@ -5,14 +5,14 @@ import PriceChart from "../PriceChart";
 import { AnalysisCard, DecisionCard } from "../research/ResearchCards";
 import TokenIcon from "../TokenIcon";
 import { useTerminal } from "./data";
+import { TraderCard } from "./Traders";
+import { ACCENT, Metric, numeric, Pill, Progress, Section, TONE_TEXT, type Tone } from "./ui";
 import {
   coinImage,
   LANE_LABEL,
   LANE_TONE,
-  SCREEN_TONE,
   SETUP_LABEL,
   solSigned,
-  VERDICT_TONE,
   type CoinDetail,
   type Flow,
   type WatchedCoin,
@@ -21,7 +21,6 @@ import { fmtAge, fmtCompact, fmtPrice, pnlColor } from "@/lib/format";
 import { usePolling } from "@/lib/hooks";
 import type { ResearchReport } from "@/lib/research-types";
 
-type Tone = "ok" | "warn" | "bad" | "info" | "idle" | "live";
 const TONE: Record<Tone, string> = {
   ok: "text-emerald-400",
   warn: "text-amber-400",
@@ -30,6 +29,35 @@ const TONE: Record<Tone, string> = {
   idle: "text-zinc-600",
   live: "text-sky-400",
 };
+
+const countOk = (checks: { ok: boolean }[]) => checks.filter((k) => k.ok).length;
+const screenCount = (screens: { level: string; status?: string }[], level: string) => screens.filter((x) => x.level === level && x.status !== "stale").length;
+const SCREEN_GROUPS: { key: string; title: string; tone: Tone }[] = [
+  { key: "veto", title: "Vetoes", tone: "bad" },
+  { key: "warn", title: "Warnings", tone: "warn" },
+  { key: "stale", title: "Stale data", tone: "idle" },
+  { key: "unknown", title: "Not verified", tone: "idle" },
+  { key: "ok", title: "Clear", tone: "ok" },
+];
+/** First clause of a decision reason, for one-line summaries. */
+const shortReason = (r: string) => (r.length > 60 ? `${r.split(":")[0]}` : r);
+
+function FlagList({ title, tone, items }: { title: string; tone: Tone; items: string[] }) {
+  if (!items.length) return null;
+  return (
+    <div>
+      <div className={`mb-0.5 text-[10px] font-semibold uppercase tracking-wide ${TONE_TEXT[tone]}`}>{title}</div>
+      <ul className="space-y-0.5">
+        {items.slice(0, 4).map((x) => (
+          <li key={x} className="flex gap-1.5 text-zinc-300">
+            <span className={TONE_TEXT[tone]}>{tone === "bad" ? "−" : "+"}</span>
+            <span>{x}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 type Step = { id: string; label: string; value: string; tone: Tone };
 
@@ -57,19 +85,6 @@ function Pipeline({ steps, open, onOpen }: { steps: Step[]; open: string[]; onOp
   );
 }
 
-function Section({ id, title, summary, open, onToggle, children }: { id: string; title: string; summary: React.ReactNode; open: boolean; onToggle: (id: string) => void; children: React.ReactNode }) {
-  return (
-    <section id={`section-${id}`} className="scroll-mt-2 rounded-lg border border-line bg-panel">
-      <button onClick={() => onToggle(id)} className="flex w-full items-center gap-3 px-3 py-2 text-left">
-        <span className={`text-[10px] text-zinc-500 transition-transform ${open ? "rotate-90" : ""}`}>▶</span>
-        <span className="label w-36 shrink-0">{title}</span>
-        <span className="min-w-0 flex-1 truncate text-[12px] text-zinc-400">{summary}</span>
-      </button>
-      {open && <div className="border-t border-line px-3 py-3">{children}</div>}
-    </section>
-  );
-}
-
 function FlowBox({ label, f }: { label: string; f: Flow }) {
   const total = f.buySol + f.sellSol;
   return (
@@ -90,6 +105,7 @@ function FlowBox({ label, f }: { label: string; f: Flow }) {
 }
 
 const ago = (ts: number) => `${fmtAge(ts)} ago`;
+const fmtMin = (m: number) => (m >= 90 ? `${(m / 60).toFixed(1)}h` : `${Math.round(m)}m`);
 
 export default function FocusView({ mint, open, onToggle }: { mint: string | null; open: string[]; onToggle: (id: string) => void }) {
   const { state, portfolio } = useTerminal();
@@ -113,6 +129,30 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
   const an = live?.analysis ?? null;
   const anFresh = !!an && an.expiresAt > Date.now();
   const researching = state?.analyst.running === symbol;
+  const lastTrade = live?.recentTrades[0];
+  const traders = live?.traders ?? [];
+  const tradersHolding = traders.filter((t) => t.holdingPct >= 5);
+  // Chart markers: the agent's fills, plus watched/discovered traders' trades labelled with their initials.
+  const markers = [
+    ...d.fills.map((x) => ({ ts: x.ts, side: x.side })),
+    ...traders.flatMap((t) =>
+      t.actions.map((a) => ({
+        ts: a.ts,
+        side: a.side,
+        label: (t.name ?? t.address).replace(/[^A-Za-z0-9]/g, "").slice(0, 3),
+        color: t.source === "watching" ? "#fbbf24" : "#38bdf8",
+      })),
+    ),
+  ];
+  const top10 = live?.holdersReport?.top.slice(0, 10).reduce((a, h) => a + h.pct, 0) ?? 0;
+  const holderScreens = live?.screens.filter((x) => ["top10", "insiders", "fresh", "funding", "devhistory", "dev", "authority"].includes(x.id)) ?? [];
+  const holderTone: Tone = !live?.holdersReport
+    ? "idle"
+    : holderScreens.some((x) => x.level === "veto")
+      ? "bad"
+      : holderScreens.some((x) => x.level === "warn")
+        ? "warn"
+        : "ok";
 
   // How the agent is processing this coin, step by step; each step opens its detail.
   const steps: Step[] = [
@@ -178,7 +218,8 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
             <div className="text-[11px] text-zinc-500">
               mcap {fmtCompact(live.quote.mcapUsd)}
               {live.quote.liquidityUsd > 0 && ` · liq ${fmtCompact(live.quote.liquidityUsd)}`}
-              {f && ` · ${(f.drawdown * 100).toFixed(0)}% off ATH`}
+              {f && ` · ${(f.drawdown * 100).toFixed(0)}% off ${f.highScope === "observed" ? "observed high" : "ATH"}`}
+              {f?.migratedAgeMin != null && ` · migrated ${fmtMin(f.migratedAgeMin)} ago`}
             </div>
           </div>
         )}
@@ -209,7 +250,7 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
 
       {d.pairAddress && (
         <div className="overflow-hidden rounded-lg border border-line bg-panel [&>div]:rounded-none [&>div]:border-0">
-          <PriceChart pairAddress={d.pairAddress} livePrice={live?.quote?.priceUsd ?? 0} markers={d.fills.map((x) => ({ ts: x.ts, side: x.side }))} />
+          <PriceChart pairAddress={d.pairAddress} livePrice={live?.quote?.priceUsd ?? 0} markers={markers} />
         </div>
       )}
 
@@ -227,21 +268,33 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
           title="Agent on this coin"
           open={open.includes("position")}
           onToggle={onToggle}
-          summary={
+          tone={position ? ((position.unrealizedSol ?? 0) >= 0 ? "ok" : "bad") : closed.length ? (realized >= 0 ? "ok" : "bad") : "idle"}
+          badge={position ? "Holding" : closed.length ? "Closed" : "Flat"}
+          chips={
             position
-              ? `Holding ${position.costSol.toFixed(3)}◎ · ${SETUP_LABEL[position.setup] ?? position.setup} · stop ${(((position.stopSol / position.entryPriceSol) - 1) * 100).toFixed(0)}%`
+              ? [
+                  { label: "size", value: `${position.costSol.toFixed(3)}◎` },
+                  { label: "setup", value: SETUP_LABEL[position.setup] ?? position.setup },
+                  { label: "stop", value: `${((position.stopSol / position.entryPriceSol - 1) * 100).toFixed(0)}%`, tone: "bad" },
+                  ...(position.unrealizedSol != null ? [{ label: "P&L", value: solSigned(position.unrealizedSol), tone: (position.unrealizedSol >= 0 ? "ok" : "bad") as Tone }] : []),
+                ]
               : closed.length
-                ? `${closed.length} closed · realized ${solSigned(realized)}`
-                : "No trades on this coin"
+                ? [
+                    { label: "trades", value: closed.length },
+                    { label: "realized", value: solSigned(realized), tone: realized >= 0 ? "ok" : "bad" },
+                  ]
+                : [{ value: "No trades on this coin", tone: "idle" }]
           }
         >
           {d.fills.length === 0 && <p className="text-xs text-zinc-500">No fills yet.</p>}
           <div className="divide-y divide-line text-xs">
             {[...d.fills].reverse().map((x, i) => (
-              <div key={`${x.ts}-${i}`} className="num flex gap-4 py-1.5">
-                <span className={x.side === "buy" ? "text-emerald-400" : "text-rose-400"}>{x.side.toUpperCase()}</span>
-                <span className="text-zinc-300">{x.sol.toFixed(3)}◎</span>
-                <span className="text-zinc-500">{x.reason ?? ""}</span>
+              <div key={`${x.ts}-${i}`} className="num flex items-center gap-4 py-1.5">
+                <Pill tone={x.side === "buy" ? "ok" : "bad"} icon={false}>
+                  {x.side}
+                </Pill>
+                <span className="text-zinc-200">{x.sol.toFixed(3)}◎</span>
+                <span className="text-zinc-400">{x.reason ?? ""}</span>
                 <span className="ml-auto text-zinc-600">{ago(x.ts)}</span>
               </div>
             ))}
@@ -253,25 +306,74 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
           title="Decisions"
           open={open.includes("decision")}
           onToggle={onToggle}
-          summary={decisions[0] ? `${decisions[0].take ? "Bought" : "Passed"} ${ago(decisions[0].at)} · ${decisions.length} on this coin` : "The agent hasn't decided on this coin"}
+          tone={!decisions[0] ? "idle" : decisions[0].take ? "ok" : "warn"}
+          badge={!decisions[0] ? "None" : decisions[0].take ? "Buy" : "Pass"}
+          chips={
+            decisions[0]
+              ? [
+                  { label: "last", value: ago(decisions[0].at) },
+                  { label: "total", value: decisions.length },
+                  ...(decisions[0].take
+                    ? [{ label: "size", value: `${decisions[0].sizeSol.toFixed(3)}◎`, tone: "ok" as Tone }]
+                    : decisions[0].reasons[0]
+                      ? [{ label: "why", value: shortReason(decisions[0].reasons[0]), tone: "warn" as Tone }]
+                      : []),
+                ]
+              : [{ value: "Decides only when a setup fires", tone: "idle" }]
+          }
         >
           {!decisions.length && <p className="text-xs text-zinc-500">Decisions appear when a setup fires.</p>}
-          <div className="space-y-2">
+          <div className="space-y-3">
             {decisions.map((x, i) => (
-              <div key={`${x.at}-${i}`} className="rounded-md border border-line p-2 text-xs">
+              <div key={`${x.at}-${i}`} className={`rounded-md border border-l-2 border-line p-3 text-xs ${ACCENT[x.take ? "ok" : "warn"]}`}>
                 <div className="flex items-center gap-2">
-                  <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${x.take ? "bg-emerald-500/15 text-emerald-300" : "bg-zinc-800 text-zinc-400"}`}>
-                    {x.take ? "BUY" : "PASS"}
-                  </span>
-                  <span className="text-zinc-300">{SETUP_LABEL[x.setup] ?? x.setup}</span>
-                  <span className="num ml-auto text-zinc-600">{ago(x.at)}</span>
+                  <Pill tone={x.take ? "ok" : "warn"} size="md">
+                    {x.take ? "Buy" : "Pass"}
+                  </Pill>
+                  <span className="text-[13px] text-zinc-100">{SETUP_LABEL[x.setup] ?? x.setup}</span>
+                  <span className="num ml-auto text-zinc-500">{ago(x.at)}</span>
                 </div>
-                <div className="num mt-1 text-zinc-500">
-                  size {x.sizeSol.toFixed(3)}◎ · {x.mode === "explore" ? `exploring (${x.n}/15)` : `benchmark ${x.n} trades`} · analyst {x.analyst.verdict} ×
-                  {x.analyst.conviction.toFixed(2)}
-                  {x.regime && ` · regime ${x.regime.level}`}
+                <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                  <Metric label={x.take ? "Size" : "Proposed size"} value={`${x.sizeSol.toFixed(3)}◎`} tone={x.take ? "ok" : undefined} />
+                  <Metric label="Evidence" value={x.mode === "explore" ? `Exploring ${x.n}/15` : `${x.n} trades`} />
+                  <Metric
+                    label="Analyst"
+                    value={`${x.analyst.verdict} ×${x.analyst.conviction.toFixed(2)}`}
+                    tone={x.analyst.verdict === "reject" ? "bad" : x.analyst.verdict === "approve" ? "ok" : undefined}
+                  />
+                  <Metric label="Regime" value={x.regime?.level ?? "–"} tone={x.regime?.level === "bad" ? "bad" : x.regime?.level === "caution" ? "warn" : undefined} />
                 </div>
-                {x.reasons.length > 0 && <div className="mt-0.5 text-zinc-400">{x.reasons.join(" · ")}</div>}
+                {x.costs && (
+                  <div className="mt-1.5 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                    <Metric label="Round-trip cost" value={`${(x.costs.roundTripCostPct * 100).toFixed(1)}%`} hint={`Own price impact ${(x.costs.entryImpact * 100).toFixed(2)}%`} />
+                    <Metric label="Net at TP1" value={`${x.costs.tp1NetSol >= 0 ? "+" : ""}${x.costs.tp1NetSol.toFixed(4)}◎`} tone="ok" />
+                    <Metric label="Net at stop" value={`${x.costs.stopNetSol.toFixed(4)}◎`} tone="bad" />
+                    <Metric label="Net reward/risk" value={x.costs.netRewardRisk.toFixed(2)} tone={x.costs.netRewardRisk >= 1 ? "ok" : "warn"} />
+                  </div>
+                )}
+                {x.reasons.length > 0 && (
+                  <div className="mt-2">
+                    <div className="mb-1 text-[10px] uppercase tracking-wide text-zinc-500">Why it passed</div>
+                    <ul className="space-y-1">
+                      {x.reasons.map((r) => (
+                        <li key={r} className="flex gap-2 text-zinc-300">
+                          <span className="text-amber-400">✕</span>
+                          <span>{r}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {x.essentials && x.essentials.length > 0 && (
+                  <div className="mt-2 flex flex-wrap items-center gap-1">
+                    <span className="mr-1 text-[10px] uppercase tracking-wide text-zinc-500">Required evidence</span>
+                    {x.essentials.map((e) => (
+                      <span key={e.id} title={e.detail}>
+                        <Pill tone={e.ok ? "ok" : "warn"}>{e.label}</Pill>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -283,25 +385,61 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
             title="Setup checks"
             open={open.includes("setups")}
             onToggle={onToggle}
-            summary={best ? `${best.status === "fire" ? "Firing" : "Armed"}: ${SETUP_LABEL[best.setup]} · ${best.trigger.filter((k) => !k.ok).map((k) => k.label).join(", ") || "all checks pass"}` : "No setup has formed"}
+            tone={!best ? "idle" : best.status === "fire" ? "ok" : best.episode?.state === "cooldown" ? "idle" : "info"}
+            badge={!best ? "None" : best.status === "fire" ? "Firing" : best.episode?.state === "cooldown" ? "Cooldown" : `Armed ${countOk(best.trigger)}/${best.trigger.length}`}
+            chips={
+              best
+                ? [
+                    { value: SETUP_LABEL[best.setup] ?? best.setup },
+                    ...(best.episode && best.episode.state !== "cooldown" ? [{ label: "armed", value: ago(best.episode.armedAt) }] : []),
+                    ...best.trigger.filter((k) => !k.ok).slice(0, 2).map((k) => ({ label: "waiting", value: k.label, tone: "warn" as Tone })),
+                  ]
+                : [{ value: "No setup has formed", tone: "idle" }]
+            }
           >
             {!live.setups.length && <p className="text-xs text-zinc-500">None of the five setups has formed its structure on this coin.</p>}
             <div className="grid gap-3 md:grid-cols-2">
-              {live.setups.map((x) => (
-                <div key={x.setup} className="text-xs">
-                  <div className={`mb-1 font-semibold ${x.status === "fire" ? "text-emerald-300" : "text-violet-300"}`}>
-                    {x.status === "fire" ? "Firing" : "Armed"}: {SETUP_LABEL[x.setup] ?? x.setup}
-                  </div>
-                  {[...x.structure, ...x.trigger].map((k) => (
-                    <div key={k.label} className="flex justify-between gap-2">
-                      <span className={k.ok ? "text-zinc-300" : "text-zinc-500"}>
-                        {k.ok ? "✓" : "✗"} {k.label}
+              {live.setups.map((x) => {
+                const all = [...x.structure, ...x.trigger];
+                const tone: Tone = x.status === "fire" ? "ok" : x.episode?.state === "cooldown" ? "idle" : "info";
+                return (
+                  <div key={x.setup} className={`rounded-md border border-l-2 border-line p-3 text-xs ${ACCENT[tone]}`}>
+                    <div className="flex items-center gap-2">
+                      <Pill tone={tone}>{x.status === "fire" ? "Firing" : x.episode?.state === "cooldown" ? "Cooldown" : "Armed"}</Pill>
+                      <span className="text-[13px] text-zinc-100">{SETUP_LABEL[x.setup] ?? x.setup}</span>
+                      <span className="num ml-auto text-zinc-400">
+                        {countOk(all)}/{all.length}
                       </span>
-                      <span className="num text-zinc-500">{k.value}</span>
                     </div>
-                  ))}
-                </div>
-              ))}
+                    <div className="mt-2">
+                      <Progress done={countOk(all)} total={all.length} tone={tone} />
+                    </div>
+                    {x.episode && (
+                      <div className="num mt-1.5 text-[11px] text-zinc-500">
+                        {x.episode.state === "cooldown"
+                          ? `Last episode failed · signals resume ${x.episode.cooldownUntil ? `in ${fmtMin(Math.max(0, (x.episode.cooldownUntil - Date.now()) / 60_000))}` : "soon"}`
+                          : `Armed ${ago(x.episode.armedAt)}${x.episode.firedAt ? ` · fired ${ago(x.episode.firedAt)}` : ""}`}
+                      </div>
+                    )}
+                    {[
+                      { name: "Structure", checks: x.structure },
+                      { name: "Trigger", checks: x.trigger },
+                    ].map((g) => (
+                      <div key={g.name} className="mt-2">
+                        <div className="mb-0.5 text-[10px] uppercase tracking-wide text-zinc-500">{g.name}</div>
+                        {g.checks.map((k) => (
+                          <div key={k.label} className="flex justify-between gap-2 py-0.5">
+                            <span className={k.ok ? "text-zinc-300" : "text-amber-200"}>
+                              <span className={k.ok ? "text-emerald-400" : "text-amber-400"}>{k.ok ? "✓" : "✕"}</span> {k.label}
+                            </span>
+                            <span className={`${numeric(k.value) ? "num" : ""} text-right ${k.ok ? "text-zinc-500" : "text-amber-300/80"}`}>{k.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
             </div>
           </Section>
         )}
@@ -312,24 +450,72 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
             title="Risk screens"
             open={open.includes("screens")}
             onToggle={onToggle}
-            summary={
-              vetoes.length || warns.length
-                ? [...vetoes, ...warns].map((x) => `${x.level === "veto" ? "✗" : "!"} ${x.label}`).join(" · ")
-                : `${live.screens.filter((x) => x.level === "ok").length} checks clear`
+            tone={vetoes.length ? "bad" : warns.length ? "warn" : "ok"}
+            badge={vetoes.length ? `${vetoes.length} veto` : warns.length ? `${warns.length} warning${warns.length > 1 ? "s" : ""}` : "Clear"}
+            chips={[
+              ...[...vetoes, ...warns].slice(0, 3).map((x) => ({ value: x.label, tone: (x.level === "veto" ? "bad" : "warn") as Tone })),
+              { label: "clear", value: screenCount(live.screens, "ok"), tone: "ok" },
+              ...(screenCount(live.screens, "unknown") ? [{ label: "unknown", value: screenCount(live.screens, "unknown"), tone: "idle" as Tone }] : []),
+            ]}
+          >
+            <div className="space-y-3">
+              {SCREEN_GROUPS.map((g) => {
+                const rows = live.screens.filter((x) => (x.status === "stale" ? "stale" : x.level) === g.key);
+                if (!rows.length) return null;
+                return (
+                  <div key={g.key}>
+                    <div className={`mb-1 text-[10px] font-semibold uppercase tracking-wide ${TONE_TEXT[g.tone]}`}>
+                      {g.title} · {rows.length}
+                    </div>
+                    <div className="grid gap-1.5 md:grid-cols-2">
+                      {rows.map((x) => (
+                        <div key={x.id} className={`rounded-md border border-l-2 border-line px-2.5 py-1.5 text-xs ${ACCENT[g.tone]}`}>
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium text-zinc-100">{x.label}</span>
+                            {x.observedAt && <span className="num ml-auto text-[10px] text-zinc-600">{ago(x.observedAt)}</span>}
+                          </div>
+                          <div className="mt-0.5 leading-snug text-zinc-400">{x.detail}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </Section>
+        )}
+
+        {live && (
+          <Section
+            id="traders"
+            title="Traders on this coin"
+            open={open.includes("traders")}
+            onToggle={onToggle}
+            tone={!traders.length ? "idle" : tradersHolding.length ? "warn" : "info"}
+            badge={!traders.length ? "None" : tradersHolding.length ? `${tradersHolding.length} holding` : `${traders.length} exited`}
+            chips={
+              traders.length
+                ? traders.slice(0, 3).map((t) => ({
+                    label: t.name ?? `${t.address.slice(0, 4)}…`,
+                    value: `${t.multiple ? `${t.multiple.toFixed(2)}x` : "–"} · ${t.holdingPct.toFixed(0)}% held`,
+                    tone: (t.multiple && t.multiple >= 1 ? "ok" : "bad") as Tone,
+                  }))
+                : [{ value: "No watched or discovered trader has traded this coin", tone: "idle" }]
             }
           >
-            <div className="grid gap-1.5 md:grid-cols-2">
-              {[...live.screens]
-                .sort((a, b) => ["veto", "warn", "unknown", "ok"].indexOf(a.level) - ["veto", "warn", "unknown", "ok"].indexOf(b.level))
-                .map((x) => (
-                  <div key={x.id} className="flex items-start gap-2 text-xs">
-                    <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] ${SCREEN_TONE[x.level]}`}>{x.level}</span>
-                    <span className="text-zinc-300">
-                      <b className="font-medium text-white">{x.label}:</b> {x.detail}
-                    </span>
-                  </div>
-                ))}
+            {!traders.length && (
+              <p className="text-xs text-zinc-500">Add wallets in the Traders tab (dock, key 5). Discovered wallets appear here automatically when they trade.</p>
+            )}
+            <div className="grid gap-2 md:grid-cols-2">
+              {traders.map((t) => (
+                <TraderCard key={t.address} t={t} />
+              ))}
             </div>
+            {traders.length > 0 && (
+              <p className="mt-2 text-[11px] text-zinc-500">
+                Shown as evidence, not a signal: the agent doesn&apos;t copy these trades. &ldquo;What predicts winners&rdquo; measures whether their presence actually helped.
+              </p>
+            )}
           </Section>
         )}
 
@@ -338,33 +524,33 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
           title="Research"
           open={researchOpen}
           onToggle={onToggle}
-          summary={
-            researching
-              ? "Codex is researching this coin now…"
-              : an
-                ? `${an.verdict} ×${an.conviction.toFixed(2)} · ${an.narrative}`
-                : "No Codex report yet — the agent researches coins as setups develop"
+          tone={researching ? "live" : !an ? "idle" : !anFresh ? "idle" : an.verdict === "reject" ? "bad" : an.verdict === "approve" ? "ok" : "warn"}
+          badge={researching ? "Researching" : an ? an.verdict : "None"}
+          chips={
+            an
+              ? [
+                  { label: "size", value: `×${an.conviction.toFixed(2)}` },
+                  { label: "narrative", value: an.narrativeType },
+                  { value: anFresh ? `valid ${Math.round((an.expiresAt - Date.now()) / 60_000)}m` : "expired", tone: anFresh ? undefined : "idle" },
+                ]
+              : [{ value: researching ? "Codex is reading sources…" : "Researched as setups develop", tone: "idle" }]
           }
         >
           {an && (
-            <div className={`mb-3 rounded-md border p-3 text-xs ${VERDICT_TONE[an.verdict]}`}>
-              <div className="flex justify-between font-semibold">
-                <span>
-                  {an.verdict} · {an.narrativeType} · ×{an.conviction.toFixed(2)}
-                </span>
-                <span className="font-normal opacity-70">{anFresh ? `valid ${Math.round((an.expiresAt - Date.now()) / 60_000)}m` : "expired"}</span>
+            <div className={`mb-3 rounded-md border border-l-2 border-line p-3 text-xs ${ACCENT[an.verdict === "reject" ? "bad" : an.verdict === "approve" ? "ok" : "warn"]}`}>
+              <div className="flex items-center gap-2">
+                <Pill tone={an.verdict === "reject" ? "bad" : an.verdict === "approve" ? "ok" : "warn"} size="md">
+                  {an.verdict} ×{an.conviction.toFixed(2)}
+                </Pill>
+                <span className="text-zinc-400">{an.narrativeType} narrative</span>
+                <span className="ml-auto text-zinc-500">{anFresh ? `valid ${Math.round((an.expiresAt - Date.now()) / 60_000)}m` : "expired"}</span>
               </div>
-              <p className="mt-1 text-zinc-200">{an.thesis}</p>
-              {an.redFlags.slice(0, 3).map((r) => (
-                <p key={r} className="text-rose-300">
-                  − {r}
-                </p>
-              ))}
-              {an.greenFlags.slice(0, 3).map((g) => (
-                <p key={g} className="text-emerald-300">
-                  + {g}
-                </p>
-              ))}
+              <p className="mt-2 text-[13px] leading-snug text-zinc-100">{an.narrative}</p>
+              <p className="mt-1 leading-relaxed text-zinc-400">{an.thesis}</p>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                <FlagList title="Against" tone="bad" items={an.redFlags} />
+                <FlagList title="For" tone="ok" items={an.greenFlags} />
+              </div>
             </div>
           )}
           {!research && <p className="text-xs text-zinc-500">Loading research history…</p>}
@@ -396,21 +582,32 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
             title="Holders & developer"
             open={open.includes("holders")}
             onToggle={onToggle}
-            summary={[
-              live.holdersReport ? `top-10 ${live.holdersReport.top.slice(0, 10).reduce((a, h) => a + h.pct, 0).toFixed(1)}%` : "holders pending",
-              live.funding ? `${live.funding.fresh} fresh · cluster ${live.funding.topClusterPct.toFixed(1)}%` : "wallets pending",
-              live.dev ? `dev ${live.dev.launches}${live.dev.capped ? "+" : ""} launches · ${live.dev.successes} hits` : "dev pending",
-            ].join(" · ")}
+            tone={holderTone}
+            badge={holderTone === "bad" ? "Veto" : holderTone === "warn" ? "Caution" : holderTone === "idle" ? "Pending" : "Clear"}
+            chips={[
+              live.holdersReport ? { label: "top-10", value: `${top10.toFixed(1)}%`, tone: top10 >= 35 ? "bad" : top10 >= 25 ? "warn" : undefined } : { label: "holders", value: "pending", tone: "idle" },
+              live.funding
+                ? { label: "fresh wallets", value: `${live.funding.fresh}/${live.funding.checked}`, tone: live.funding.fresh >= 3 ? "warn" : undefined }
+                : { label: "wallets", value: "pending", tone: "idle" },
+              ...(live.funding ? [{ label: "cluster", value: `${live.funding.topClusterPct.toFixed(1)}%`, tone: (live.funding.topClusterPct >= 5 ? "warn" : undefined) as Tone | undefined }] : []),
+              live.dev
+                ? { label: "dev", value: `${live.dev.launches}${live.dev.capped ? "+" : ""} launches · ${live.dev.successes} hits` }
+                : { label: "dev", value: "pending", tone: "idle" },
+            ]}
           >
             <div className="grid gap-4 md:grid-cols-2">
               <div className="text-xs">
                 <div className="label mb-1">Top holders · {live.holdersReport?.totalHolders?.toLocaleString() ?? "?"} total</div>
                 {live.holdersReport?.top.slice(0, 10).map((h) => (
-                  <div key={h.owner} className="num flex justify-between py-0.5">
-                    <span className="text-zinc-400">
-                      {h.owner.slice(0, 4)}…{h.owner.slice(-4)} {h.insider && <span className="text-rose-400">insider</span>}
+                  <div key={h.owner} className="num flex items-center gap-2 py-0.5">
+                    <span className="w-24 text-zinc-400">
+                      {h.owner.slice(0, 4)}…{h.owner.slice(-4)}
                     </span>
-                    <span className="text-zinc-300">{h.pct.toFixed(2)}%</span>
+                    <div className="h-1 flex-1 overflow-hidden rounded-full bg-zinc-800">
+                      <div className={`h-full ${h.insider ? "bg-rose-400" : "bg-zinc-500"}`} style={{ width: `${Math.min(100, h.pct * 5)}%` }} />
+                    </div>
+                    <span className="w-12 text-right text-zinc-300">{h.pct.toFixed(2)}%</span>
+                    {h.insider && <Pill tone="bad" icon={false}>insider</Pill>}
                   </div>
                 ))}
               </div>
@@ -418,32 +615,35 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
                 <div>
                   <div className="label mb-1">Top-holder wallets</div>
                   {live.funding ? (
-                    <>
-                      <p className="text-zinc-300">
-                        {live.funding.fresh} of {live.funding.checked} under a day old ({live.funding.freshPct.toFixed(1)}% of supply)
-                      </p>
-                      {live.funding.clusters.length ? (
-                        live.funding.clusters.map((c) => (
-                          <p key={c.funder} className="text-amber-300">
-                            {c.wallets.length} wallets share funder {c.funder.slice(0, 4)}…{c.funder.slice(-4)} · {c.pct.toFixed(1)}%
-                          </p>
-                        ))
-                      ) : (
-                        <p className="text-zinc-500">No shared (non-exchange) funders.</p>
-                      )}
-                    </>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      <Metric label="Under a day old" value={`${live.funding.fresh} of ${live.funding.checked}`} tone={live.funding.fresh >= 3 ? "warn" : undefined} />
+                      <Metric label="Their supply" value={`${live.funding.freshPct.toFixed(1)}%`} />
+                      <Metric label="Shared funder" value={`${live.funding.topClusterPct.toFixed(1)}%`} tone={live.funding.topClusterPct >= 5 ? "warn" : undefined} />
+                    </div>
                   ) : (
                     <p className="text-zinc-500">Wallet checks pending.</p>
                   )}
+                  {live.funding?.clusters.map((c) => (
+                    <p key={c.funder} className="mt-1 text-amber-300">
+                      {c.wallets.length} wallets share funder {c.funder.slice(0, 4)}…{c.funder.slice(-4)} · {c.pct.toFixed(1)}%
+                    </p>
+                  ))}
                 </div>
                 <div>
                   <div className="label mb-1">Developer</div>
                   {live.dev ? (
-                    <p className="text-zinc-300">
-                      {live.dev.launches}
-                      {live.dev.capped ? "+" : ""} prior launches ({live.dev.launches24h} in 24h) · {live.dev.graduated} graduated · best ATH $
-                      {Math.round(live.dev.bestAthUsd / 1000)}k · {live.dev.died} died
-                    </p>
+                    <>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        <Metric label="Prior launches" value={`${live.dev.launches}${live.dev.capped ? "+" : ""}`} hint={`${live.dev.launches24h} in the last 24h`} />
+                        <Metric label="Graduated" value={live.dev.graduated} />
+                        <Metric label="Best ATH" value={`$${Math.round(live.dev.bestAthUsd / 1000)}k`} />
+                      </div>
+                      {live.dev.resolved !== undefined && (
+                        <p className="mt-1 text-zinc-500">
+                          {live.dev.successes} of {live.dev.resolved} resolved launches succeeded · success rate ≥ {((live.dev.successLowerBound ?? 0) * 100).toFixed(0)}% (95%)
+                        </p>
+                      )}
+                    </>
                   ) : (
                     <p className="text-zinc-500">Not looked up yet.</p>
                   )}
@@ -459,21 +659,29 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
             title="Order flow"
             open={open.includes("flow")}
             onToggle={onToggle}
-            summary={`60s: ${f.flow60s.netSol >= 0 ? "+" : ""}${f.flow60s.netSol.toFixed(2)}◎ · ${f.flow60s.buyers} buyers / ${f.flow60s.sellers} sellers · exhaustion ${
-              f.exhaustion === null ? "idle" : `${Math.round(f.exhaustion * 100)}`
-            }`}
+            tone={f.flow60s.buyers + f.flow60s.sellers === 0 ? "idle" : f.flow60s.netSol > 0 ? "ok" : "bad"}
+            badge={f.flow60s.buyers + f.flow60s.sellers === 0 ? "Quiet" : f.flow60s.netSol > 0 ? "Net buying" : "Net selling"}
+            chips={[
+              { label: "60s net", value: `${f.flow60s.netSol >= 0 ? "+" : ""}${f.flow60s.netSol.toFixed(2)}◎`, tone: f.flow60s.netSol >= 0 ? "ok" : "bad" },
+              { label: "buyers", value: f.flow60s.buyers, tone: "ok" },
+              { label: "sellers", value: f.flow60s.sellers, tone: "bad" },
+              { label: "seller exhaustion", value: f.exhaustion === null ? "idle" : `${Math.round(f.exhaustion * 100)}%` },
+            ]}
           >
             <div className="grid gap-2 sm:grid-cols-3">
               <FlowBox label="Last 15s" f={f.flow15s} />
               <FlowBox label="Last 60s" f={f.flow60s} />
               <FlowBox label="Last 5m" f={f.flow5m} />
             </div>
+            {f.tapeFromLaunch && f.cohortsReliable === false && (
+              <p className="mt-3 text-xs text-amber-300/80">Tape has {f.tapeGaps} gap(s) since launch; cohort holdings below may be understated.</p>
+            )}
             {f.tapeFromLaunch && (
-              <div className="num mt-3 flex flex-wrap gap-x-4 text-xs text-zinc-400">
-                <span>dev {f.cohorts.dev.heldPct.toFixed(1)}%</span>
-                <span>snipers {f.cohorts.snipers.heldPct.toFixed(1)}%</span>
-                <span>bundles {f.cohorts.bundles.heldPct.toFixed(1)}%</span>
-                <span>early {f.cohorts.early.heldPct.toFixed(1)}%</span>
+              <div className="mt-3 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                <Metric label="Dev holds" value={`${f.cohorts.dev.heldPct.toFixed(1)}%`} />
+                <Metric label="Snipers hold" value={`${f.cohorts.snipers.heldPct.toFixed(1)}%`} />
+                <Metric label="Bundles hold" value={`${f.cohorts.bundles.heldPct.toFixed(1)}%`} />
+                <Metric label="Early buyers hold" value={`${f.cohorts.early.heldPct.toFixed(1)}%`} />
               </div>
             )}
           </Section>
@@ -485,17 +693,27 @@ export default function FocusView({ mint, open, onToggle }: { mint: string | nul
             title="Live tape"
             open={open.includes("tape")}
             onToggle={onToggle}
-            summary={live.recentTrades[0] ? `last ${live.recentTrades[0].side} ${live.recentTrades[0].sol.toFixed(3)}◎ ${ago(live.recentTrades[0].ts)}` : "No trades read yet"}
+            tone={lastTrade && Date.now() - lastTrade.ts < 60_000 ? "live" : "idle"}
+            badge={lastTrade && Date.now() - lastTrade.ts < 60_000 ? "Live" : "Quiet"}
+            chips={
+              lastTrade
+                ? [
+                    { label: `last ${lastTrade.side}`, value: `${lastTrade.sol.toFixed(3)}◎`, tone: lastTrade.side === "buy" ? "ok" : "bad" },
+                    { value: ago(lastTrade.ts) },
+                    { label: "shown", value: live.recentTrades.length },
+                  ]
+                : [{ value: "No trades read yet", tone: "idle" }]
+            }
           >
             <div className="scroll-thin max-h-72 overflow-y-auto text-xs">
               {live.recentTrades.map((t) => (
-                <div key={t.id} className="num flex justify-between py-0.5">
+                <div key={t.id} className="num grid grid-cols-[3rem_5rem_1fr_3rem] items-center gap-2 py-0.5">
                   <span className={t.side === "buy" ? "text-emerald-400" : "text-rose-400"}>{t.side}</span>
-                  <span className="text-zinc-300">{t.sol.toFixed(3)}◎</span>
+                  <span className="text-right text-zinc-200">{t.sol.toFixed(3)}◎</span>
                   <span className="text-zinc-500">
                     {t.wallet.slice(0, 4)}…{t.wallet.slice(-4)}
                   </span>
-                  <span className="text-zinc-600">{fmtAge(t.ts)}</span>
+                  <span className="text-right text-zinc-600">{fmtAge(t.ts)}</span>
                 </div>
               ))}
             </div>

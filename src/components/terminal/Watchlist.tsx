@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import TokenIcon from "../TokenIcon";
 import { useTerminal } from "./data";
+import Pulse from "./Pulse";
 import { coinImage, type WatchedCoin } from "@/lib/agent";
 import { fmtAge, fmtCompact } from "@/lib/format";
 
@@ -76,7 +77,48 @@ function Row({ c, selected, onSelect, solUsd }: { c: WatchedCoin; selected: bool
   );
 }
 
+type Mode = "pulse" | "agent";
+const MODE_KEY = "dgn.watchlist.mode";
+
 export default function Watchlist({ selected, onSelect }: { selected: string | null; onSelect: (mint: string) => void }) {
+  const [mode, setModeState] = useState<Mode>("pulse");
+  useEffect(() => {
+    try {
+      const m = localStorage.getItem(MODE_KEY);
+      if (m === "pulse" || m === "agent") setModeState(m);
+    } catch {}
+  }, []);
+  const setMode = (m: Mode) => {
+    setModeState(m);
+    try {
+      localStorage.setItem(MODE_KEY, m);
+    } catch {}
+  };
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex items-center gap-1 border-b border-line px-2 py-1.5">
+        {(
+          [
+            ["pulse", "Pulse"],
+            ["agent", "Agent watch"],
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            onClick={() => setMode(id)}
+            className={`rounded px-2 py-0.5 text-[11.5px] ${mode === id ? "bg-zinc-800 text-white" : "text-zinc-500 hover:text-zinc-200"}`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="min-h-0 flex-1">{mode === "pulse" ? <Pulse selected={selected} onSelect={onSelect} /> : <AgentWatch selected={selected} onSelect={onSelect} />}</div>
+    </div>
+  );
+}
+
+/** The coins the agent is deep-watching right now, closest to a trade first. */
+function AgentWatch({ selected, onSelect }: { selected: string | null; onSelect: (mint: string) => void }) {
   const { state, solUsd } = useTerminal();
   const [showWatching, setShowWatching] = useState(true);
   if (!state) return <div className="p-3 text-xs text-zinc-500">Connecting…</div>;
@@ -84,7 +126,7 @@ export default function Watchlist({ selected, onSelect }: { selected: string | n
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-line px-3 py-2">
-        <span className="label">Watchlist</span>
+        <span className="label">Deep-watched</span>
         <span className="num text-[10.5px] text-zinc-600">
           {state.stats.hot} watched · {state.stats.tracked} tracked
         </span>

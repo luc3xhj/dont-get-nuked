@@ -6,6 +6,9 @@ import EvidencePanel from "../EvidencePanel";
 import { ClosedTrades, OpenPositions } from "../PositionsTable";
 import { AnalysisCard, CHANGED, DecisionCard } from "../research/ResearchCards";
 import { useTerminal } from "./data";
+import Funnel from "./Funnel";
+import { TradersTab } from "./Traders";
+import { Metric } from "./ui";
 import type { DockTab, Layout } from "./layout";
 import { pctSigned, SETUP_LABEL, type Account, type DatasetSummary, type Stats } from "@/lib/agent";
 import { fmtAge, pnlColor } from "@/lib/format";
@@ -17,6 +20,7 @@ const TABS: { id: DockTab; label: string }[] = [
   { id: "trades", label: "Trades" },
   { id: "decisions", label: "Decisions" },
   { id: "research", label: "Research audit" },
+  { id: "traders", label: "Traders" },
   { id: "performance", label: "Performance" },
   { id: "evidence", label: "What predicts winners" },
   { id: "dataset", label: "Rug dataset" },
@@ -149,9 +153,27 @@ function Performance() {
 function Decisions({ onSelect }: { onSelect: (mint: string) => void }) {
   const { portfolio } = useTerminal();
   const rows = portfolio?.decisions ?? [];
-  if (!rows.length) return <div className="p-4 text-xs text-zinc-500">No setup has fired since the agent last restarted.</div>;
+  const cov = portfolio?.researchCoverage;
+  const header = portfolio?.strategyVersion && (
+    <div className="num border-b border-line px-3 py-1.5 text-[11px] text-zinc-500">
+      Strategy {portfolio.strategyVersion} · learns from {portfolio.evidenceVersions?.join(", ") ?? "–"}
+      {cov &&
+        ` · research coverage ${cov.decisions ? `${(cov.share * 100).toFixed(0)}% of ${cov.decisions} decisions` : "no decisions yet"}${cov.medianAgeMin != null ? `, median report age ${cov.medianAgeMin.toFixed(0)}m` : ""}`}
+    </div>
+  );
+  if (!rows.length)
+    return (
+      <>
+        <Funnel onSelect={onSelect} />
+        {header}
+        <div className="p-4 text-xs text-zinc-500">No setup has fired since the agent last restarted.</div>
+      </>
+    );
   return (
-    <table className="w-full text-xs">
+    <>
+      <Funnel onSelect={onSelect} />
+      {header}
+      <table className="w-full text-xs">
       <tbody>
         {rows.map((d, i) => (
           <tr key={`${d.mint}-${d.at}-${i}`} onClick={() => onSelect(d.mint)} className="cursor-pointer border-t border-line first:border-t-0 hover:bg-panel-2">
@@ -162,7 +184,9 @@ function Decisions({ onSelect }: { onSelect: (mint: string) => void }) {
             </td>
             <td className="px-2 py-1.5 font-semibold text-zinc-100">{d.symbol}</td>
             <td className="px-2 py-1.5 text-zinc-500">{SETUP_LABEL[d.setup] ?? d.setup}</td>
-            <td className="num px-2 py-1.5 text-zinc-400">{d.sizeSol.toFixed(3)}◎</td>
+            <td className="num px-2 py-1.5 text-zinc-400" title={d.costs ? `Round trip ${(d.costs.roundTripCostPct * 100).toFixed(1)}% · net R/R ${d.costs.netRewardRisk.toFixed(2)}` : undefined}>
+              {d.sizeSol.toFixed(3)}◎{d.costs && <span className="text-zinc-600"> · R/R {d.costs.netRewardRisk.toFixed(1)}</span>}
+            </td>
             <td className="px-2 py-1.5 text-zinc-500">
               AI {d.analyst.verdict} ×{d.analyst.conviction.toFixed(2)}
               {d.regime && ` · ${d.regime.level}`}
@@ -175,6 +199,7 @@ function Decisions({ onSelect }: { onSelect: (mint: string) => void }) {
         ))}
       </tbody>
     </table>
+    </>
   );
 }
 
@@ -186,23 +211,19 @@ function ResearchAudit() {
   const list = changedOnly ? changed : data.decisions;
   return (
     <div className="space-y-3 p-3">
-      <div className="num flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-zinc-400">
-        <span>
-          <span className="text-zinc-500">reports</span> {data.analyses.length}
-        </span>
-        <span>
-          <span className="text-zinc-500">decisions using analysis</span> {data.decisions.filter((x) => x.analysisId).length}
-        </span>
-        <span>
-          <span className="text-zinc-500">changed by analysis</span> {changed.length}
-        </span>
-        <label className="ml-auto flex cursor-pointer items-center gap-1.5">
+      <div className="flex flex-wrap items-stretch gap-2">
+        <div className="grid min-w-[16rem] flex-1 grid-cols-3 gap-2 sm:max-w-md">
+          <Metric label="Reports · 7d" value={data.analyses.length} />
+          <Metric label="Used in decisions" value={data.decisions.filter((x) => x.analysisId).length} />
+          <Metric label="Changed" value={changed.length} tone={changed.length ? "info" : undefined} />
+        </div>
+        <label className="ml-auto flex cursor-pointer items-center gap-1.5 self-center text-xs text-zinc-400">
           <input type="checkbox" checked={changedOnly} onChange={(e) => setChangedOnly(e.target.checked)} className="accent-violet-500" />
-          Changed only
+          Only decisions research changed
         </label>
       </div>
-      <p className="text-[11px] text-zinc-600">
-        Each comparison holds the market, risk limits and setup fixed, replacing analysis with the default 0.5× size. Research never creates a setup.
+      <p className="text-[11px] text-zinc-500">
+        &ldquo;Without analysis&rdquo; replays the same moment with the default 0.5× size and no verdict; the market, risk limits and setup are unchanged. Research never creates a setup.
       </p>
       <div className="grid items-start gap-3 lg:grid-cols-2">
         <div className="space-y-2">
@@ -297,6 +318,7 @@ export default function Dock({ layout, update, onSelect }: { layout: Layout; upd
         )}
         {layout.dockTab === "decisions" && <Decisions onSelect={onSelect} />}
         {layout.dockTab === "research" && <ResearchAudit />}
+        {layout.dockTab === "traders" && <TradersTab onSelect={onSelect} />}
         {layout.dockTab === "performance" && <Performance />}
         {layout.dockTab === "evidence" && <EvidencePanel />}
         {layout.dockTab === "dataset" && <Dataset />}

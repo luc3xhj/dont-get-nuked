@@ -16,11 +16,11 @@ const SHORTCUTS: [string, string][] = [
   ["W", "Show / hide watchlist"],
   ["L", "Show / hide live feed"],
   ["D", "Show / hide dock"],
-  ["1–7", "Dock tabs"],
+  ["1–8", "Dock tabs"],
   ["?", "This help"],
 ];
-const DOCK_KEYS: DockTab[] = ["positions", "trades", "decisions", "research", "performance", "evidence", "dataset"];
-const FOLLOWED = new Set(["buy", "sell", "win", "loss", "setup", "analyst"]);
+const DOCK_KEYS: DockTab[] = ["positions", "trades", "decisions", "research", "traders", "performance", "evidence", "dataset"];
+const FOLLOWED = new Set(["buy", "sell", "win", "loss", "setup", "analyst", "trader"]);
 
 function Shell() {
   const router = useRouter();
@@ -87,7 +87,7 @@ function Shell() {
       else if (k === "d") update({ dock: !layout.dock });
       else if (k === "?") setHelp((h) => !h);
       else if (k === "escape") setHelp(false);
-      else if (/^[1-7]$/.test(k)) update({ dock: true, dockTab: DOCK_KEYS[Number(k) - 1] });
+      else if (/^[1-8]$/.test(k)) update({ dock: true, dockTab: DOCK_KEYS[Number(k) - 1] });
       else return;
       e.preventDefault();
     };
@@ -95,7 +95,7 @@ function Shell() {
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  const cols = [layout.watchlist ? "264px" : null, "minmax(0,1fr)", layout.feed ? "340px" : null].filter(Boolean).join(" ");
+  const cols = [layout.watchlist ? "300px" : null, "minmax(0,1fr)", layout.feed ? "340px" : null].filter(Boolean).join(" ");
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
@@ -126,7 +126,7 @@ function Shell() {
         </div>
       ) : (
         <button onClick={() => update({ dock: true })} className="shrink-0 border-t border-line bg-panel px-3 py-1 text-left text-[11px] text-zinc-500 hover:text-zinc-200">
-          ▴ Dock: positions, trades, decisions, research audit, performance (D)
+          ▴ Dock: positions, trades, decisions, research audit, traders, performance (D)
         </button>
       )}
 

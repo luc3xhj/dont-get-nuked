@@ -3,10 +3,12 @@
 import { CONFIG } from "./config";
 import { db, journal, loadCoins, loadReport, loadTrades, saveCoin, saveReport, saveTrades } from "./db";
 import { budget } from "./http";
+import { wilsonLower } from "./stats";
 import { devReport, dsQuotes, GT_URL, gtTrades, holderReport, pumpList, socialReport, tradePage } from "./sources";
 import type { Analysis } from "./analyst";
-import type { SetupEval } from "./setups";
-import type { Coin, DevReport, Features, FundingReport, HolderReport, Quote, ScreenResult, SocialReport, Trade } from "./types";
+import type { DevHistory, SetupEval } from "./setups";
+import type { Coin, DevReport, Features, FundingReport, HolderReport, PairMarket, Quote, ScreenResult, SocialReport, Trade } from "./types";
+import { evaluatePulse, type PulseEval } from "./pulse";
 
 export type CoinState = {
   coin: Coin;
@@ -20,6 +22,8 @@ export type CoinState = {
   backfilling: boolean;
   /** Backfill attempted (once per hot stint). */
   backfilled: boolean;
+  /** Polls whose page had no overlap with the tape we held (trades may be missing). */
+  tapeGaps: number;
   nextPollAt: number;
   holders: HolderReport | null;
   social: SocialReport | null;
@@ -31,6 +35,10 @@ export type CoinState = {
   setups: SetupEval[];
   /** Latest analyst verdict (may be expired; check expiresAt). */
   analysis: Analysis | null;
+  /** DexScreener activity for the Pulse filters (volume, txns, liquidity). */
+  market?: PairMarket | null;
+  /** This coin against its Pulse column's filters. */
+  pulse?: PulseEval | null;
 };
 
 export const coins = new Map<string, CoinState>();
@@ -55,6 +63,7 @@ function stateFor(coin: Coin): CoinState {
       fromLaunch: false,
       backfilling: false,
       backfilled: false,
+      tapeGaps: 0,
       nextPollAt: 0,
       holders: loadReport<HolderReport>(coin.mint, "holders"),
       social: loadReport<SocialReport>(coin.mint, "social"),
@@ -70,7 +79,14 @@ function stateFor(coin: Coin): CoinState {
   } else {
     // Skip the first minutes after a restart: those transitions happened while we were down.
     if (s.coin.stage === "curve" && coin.stage === "migrated" && Date.now() - stats.startedAt > 120_000) graduations.push(Date.now());
-    s.coin = { ...coin, firstSeen: s.coin.firstSeen };
+    const migratedNow = s.coin.stage === "curve" && coin.stage === "migrated";
+    s.coin = {
+      ...coin,
+      firstSeen: s.coin.firstSeen,
+      // Keep what we learned about migration; list data doesn't carry it.
+      migratedAt: s.coin.migratedAt ?? (migratedNow ? Date.now() : null),
+      migratedAtSource: s.coin.migratedAtSource ?? (migratedNow ? "observed" : null),
+    };
   }
   return s;
 }
@@ -122,7 +138,13 @@ function attention(c: Coin, now: number): number {
 export async function refreshUniverse() {
   while (graduations.length && Date.now() - graduations[0] > 6 * 3600_000) graduations.shift();
   const lists = await Promise.all(
-    [pumpList("created_timestamp"), pumpList("last_trade_timestamp"), pumpList("market_cap", "&complete=false")].map((p) =>
+    [
+      pumpList("created_timestamp"),
+      pumpList("last_trade_timestamp"),
+      pumpList("market_cap", "&complete=false"),
+      // Migrated column: graduated coins that are trading now.
+      pumpList("last_trade_timestamp", "&complete=true"),
+    ].map((p) =>
       p.catch(() => {
         stats.listErrors++;
         return [] as Coin[];
@@ -137,21 +159,33 @@ export async function refreshUniverse() {
   }
   for (const [mint, s] of coins) {
     if (now - s.coin.createdAt > CONFIG.universe.maxAgeMs && !s.hot && !pinned.has(mint)) coins.delete(mint);
-    else s.score = attention(s.coin, now);
+    else {
+      s.score = attention(s.coin, now);
+      evaluatePulse(s, now);
+    }
   }
   selectHot(now);
 }
 
 function selectHot(now: number) {
   const all = [...coins.values()];
-  // Keep recently promoted coins that are still trading and still in a pool.
+  // Pulse decides eligibility: a coin its column's filters reject never takes a deep-watch slot, and a
+  // held slot is released as soon as the coin fails (e.g. snipers turn out high once the tape loads).
+  const eligible = (s: CoinState) => s.pulse && s.pulse.status !== "fail";
+  // Keep recently promoted coins that are still trading, still in a pool and still eligible.
   const keep = all.filter(
     (s) =>
       pinned.has(s.coin.mint) ||
-      (s.hot && laneOf(s.coin, now) && now - (s.hotSince ?? 0) < CONFIG.universe.minHotMs && now - lastActivity(s) < CONFIG.universe.idleMs),
+      (s.hot &&
+        eligible(s) &&
+        laneOf(s.coin, now) &&
+        now - (s.hotSince ?? 0) < CONFIG.universe.minHotMs &&
+        now - lastActivity(s) < CONFIG.universe.idleMs),
   );
   const hot = new Set(keep);
-  const ranked = all.filter((s) => !hot.has(s) && s.score > -Infinity).sort((a, b) => liveScore(b) - liveScore(a));
+  // Coins that pass every filter first, then those still being checked; attention breaks ties.
+  const rank = (s: CoinState) => (s.pulse?.status === "pass" ? 100 : 0) + liveScore(s);
+  const ranked = all.filter((s) => !hot.has(s) && eligible(s) && s.score > -Infinity).sort((a, b) => rank(b) - rank(a));
   // Fill each pool's share of slots first, then any leftover slots with the best of the rest.
   for (const [lane, slots] of Object.entries(CONFIG.universe.laneSlots) as [Lane, number][]) {
     let have = [...hot].filter((s) => laneOf(s.coin, now) === lane).length;
@@ -183,6 +217,7 @@ function selectHot(now: number) {
       s.ids.clear();
       s.fromLaunch = false;
       s.backfilled = false;
+      s.tapeGaps = 0;
     }
   }
 }
@@ -199,6 +234,12 @@ function liveScore(s: CoinState) {
 }
 
 // ---------- tape ----------
+
+/** Called with each batch of newly seen trades (e.g. watched-trader alerts). */
+export const tradeListeners: ((s: CoinState, fresh: Trade[]) => void)[] = [];
+const notifyTrades = (s: CoinState, fresh: Trade[]) => {
+  if (fresh.length) for (const l of tradeListeners) l(s, fresh);
+};
 
 function addTrade(s: CoinState, t: Trade): boolean {
   if (s.ids.has(t.tx)) return false;
@@ -218,6 +259,7 @@ async function backfill(s: CoinState) {
       const page = await tradePage(s.coin.mint, cursor);
       const fresh = page.trades.filter((t) => addTrade(s, t));
       saveTrades(fresh);
+      notifyTrades(s, fresh);
       stats.tradesIngested += fresh.length;
       if (!page.hasMore || !page.nextCursor) {
         s.fromLaunch = true;
@@ -237,8 +279,12 @@ const wantsBackfill = (s: CoinState) => !s.backfilled && s.coin.stage === "curve
 /** Live tape poll: GeckoTerminal's last 300 trades (its own rate limit, deeper than pump.fun's 100). */
 async function pollTape(s: CoinState) {
   stats.tapePolls++;
-  const fresh = (await gtTrades(s.coin.mint, pairAddress(s.coin))).filter((t) => addTrade(s, t));
+  const page = await gtTrades(s.coin.mint, pairAddress(s.coin));
+  // A full page that shares nothing with what we hold means trades in between were missed.
+  if (s.trades.length && page.length >= 250 && !page.some((t) => s.ids.has(t.tx))) s.tapeGaps++;
+  const fresh = page.filter((t) => addTrade(s, t));
   saveTrades(fresh);
+  notifyTrades(s, fresh);
   stats.tradesIngested += fresh.length;
   const last = s.trades.at(-1);
   if (last) s.coin.lastTradeAt = Math.max(s.coin.lastTradeAt, last.ts);
@@ -338,17 +384,42 @@ export async function quoteTick() {
   const quotes = await dsQuotes(hot.map((s) => pairAddress(s.coin)));
   for (const s of hot) {
     const q = quotes[pairAddress(s.coin)];
-    if (q) s.quote = q;
+    if (!q) continue;
+    s.quote = q;
+    // A PumpSwap pool is created at migration: its creation time is the migration time.
+    if (s.coin.stage === "migrated" && q.pairCreatedAt && s.coin.migratedAtSource !== "pool_created") {
+      s.coin.migratedAt = q.pairCreatedAt;
+      s.coin.migratedAtSource = "pool_created";
+    }
   }
 }
 
 // ---------- creator history ----------
 
-/** Prior launches by this coin's creator: pump.fun's record when we have it, else coins we've observed. */
-export function devHistory(s: CoinState) {
-  if (s.dev) return { coins: s.dev.launches, successes: s.dev.successes, successRate: s.dev.successRate, source: "pump.fun" as const };
+/**
+ * Prior launches by this coin's creator: pump.fun's record when we have it, else coins we've observed.
+ * Only launches before this one, and only resolved ones (old enough to know the outcome), count.
+ */
+export function devHistory(s: CoinState): DevHistory {
+  const proven = (successes: number, resolved: number, lowerBound: number) =>
+    resolved >= CONFIG.developer.minResolved && lowerBound >= CONFIG.developer.minSuccessLowerBound;
+  if (s.dev && s.dev.resolved !== undefined) {
+    const d = s.dev;
+    return { coins: d.launches, resolved: d.resolved, successes: d.successes, successRate: d.successRate, lowerBound: d.successLowerBound, proven: proven(d.successes, d.resolved, d.successLowerBound), source: "pump.fun" };
+  }
   const rows = db.prepare("SELECT data FROM coins WHERE json_extract(data, '$.creator') = ?").all(s.coin.creator) as { data: string }[];
-  const prior = rows.map((r) => JSON.parse(r.data) as Coin).filter((c) => c.mint !== s.coin.mint);
-  const successes = prior.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length;
-  return { coins: prior.length, successes, successRate: prior.length ? successes / prior.length : 0, source: "observed" as const };
+  const now = Date.now();
+  const prior = rows.map((r) => JSON.parse(r.data) as Coin).filter((c) => c.mint !== s.coin.mint && c.createdAt < s.coin.createdAt);
+  const resolved = prior.filter((c) => now - c.createdAt >= CONFIG.developer.resolveAfterMs);
+  const successes = resolved.filter((c) => c.stage === "migrated" || (c.athMcapUsd ?? 0) >= 100_000).length;
+  const lowerBound = wilsonLower(successes, resolved.length);
+  return {
+    coins: prior.length,
+    resolved: resolved.length,
+    successes,
+    successRate: resolved.length ? successes / resolved.length : 0,
+    lowerBound,
+    proven: proven(successes, resolved.length, lowerBound),
+    source: "observed",
+  };
 }

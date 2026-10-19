@@ -18,7 +18,15 @@ export type ResearchSource = {
 };
 export type ResearchBundle = { at: number; searches: SearchTrace[]; sources: ResearchSource[] };
 
-export type ImpactEffect = "blocked_entry" | "enabled_entry" | "resized_entry" | "unchanged" | "other_gates" | "no_analysis" | "expired_analysis";
+export type ImpactEffect =
+  | "blocked_entry"
+  | "enabled_entry"
+  | "resized_entry"
+  | "unchanged"
+  | "other_gates"
+  | "requirement_satisfied"
+  | "no_analysis"
+  | "expired_analysis";
 export type DecisionOutcome = { take: boolean; sizeSol: number; reasons: string[] };
 export type AnalysisImpact = {
   analysisId: string | null;

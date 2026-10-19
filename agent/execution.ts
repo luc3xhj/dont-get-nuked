@@ -16,6 +16,20 @@ export const EXEC = {
   orderTimeoutMs: 30_000,
 };
 
+/** Deterministic uniform [0, 1) stream from a string seed (FNV-1a + mulberry32), for reproducible fills. */
+export function seededRandom(seed: string): () => number {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 16777619);
+  let a = h >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 export function toPair(s: CoinState): Pair | null {
   const q = s.quote;
   if (!q || !q.priceSol || !q.priceUsd) return null;
@@ -71,9 +85,10 @@ export type Fill =
 
 const freshQuote = (s: CoinState, after: number) => !!s.quote && s.quote.at >= after && Date.now() - s.quote.at <= EXEC.quoteMaxAgeMs;
 
-export function fillBuy(s: CoinState, solIn: number, decisionPriceSol: number, notBefore: number): Fill | "wait" {
+/** `failDraw` is a seeded uniform draw for this order, so simulated failures replay identically. */
+export function fillBuy(s: CoinState, solIn: number, decisionPriceSol: number, notBefore: number, failDraw: number): Fill | "wait" {
   if (!freshQuote(s, notBefore)) return "wait";
-  if (Math.random() < EXEC.failRate) return { ok: false, reason: "transaction failed", feeSol: NETWORK_FEE_SOL };
+  if (failDraw < EXEC.failRate) return { ok: false, reason: "transaction failed", feeSol: NETWORK_FEE_SOL };
   const pool = poolOf(s);
   if (!pool) return { ok: false, reason: "no pool data", feeSol: 0 };
   const q = quoteBuy(pool, solIn);
@@ -85,9 +100,9 @@ export function fillBuy(s: CoinState, solIn: number, decisionPriceSol: number, n
   return { ok: true, sol: solIn + NETWORK_FEE_SOL, tokens, priceSol, feeSol: q.feeSol, impact: q.priceImpact };
 }
 
-export function fillSell(s: CoinState, tokensIn: number, notBefore: number): Fill | "wait" {
+export function fillSell(s: CoinState, tokensIn: number, notBefore: number, failDraw: number): Fill | "wait" {
   if (!freshQuote(s, notBefore)) return "wait";
-  if (Math.random() < EXEC.failRate) return { ok: false, reason: "transaction failed", feeSol: NETWORK_FEE_SOL };
+  if (failDraw < EXEC.failRate) return { ok: false, reason: "transaction failed", feeSol: NETWORK_FEE_SOL };
   const pool = poolOf(s);
   if (!pool) return { ok: false, reason: "no pool data", feeSol: 0 };
   const q = quoteSell(pool, tokensIn);
@@ -102,4 +117,4 @@ export function liquidationValue(s: CoinState, tokens: number): number | null {
   return quoteSell(pool, tokens).solOut;
 }
 
-export const latency = () => EXEC.minLatencyMs + Math.random() * (EXEC.maxLatencyMs - EXEC.minLatencyMs);
+export const latency = (draw: number) => EXEC.minLatencyMs + draw * (EXEC.maxLatencyMs - EXEC.minLatencyMs);

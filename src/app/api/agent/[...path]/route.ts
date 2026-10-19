@@ -8,6 +8,8 @@ async function proxy(req: Request, { params }: { params: Promise<{ path: string[
     const res = await fetch(`${AGENT}/api/${path.join("/")}${new URL(req.url).search}`, {
       method: req.method,
       cache: "no-store",
+      // Forward JSON bodies (e.g. adding a wallet to the watchlist).
+      ...(req.method === "POST" ? { body: await req.text(), headers: { "content-type": "application/json" } } : {}),
       signal: AbortSignal.timeout(5_000),
     });
     // Pass through the worker's content type (JSON, or CSV for the dataset export).

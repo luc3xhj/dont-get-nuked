@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 
-export type DockTab = "positions" | "trades" | "decisions" | "research" | "performance" | "evidence" | "dataset";
-export type FeedFilter = "all" | "trades" | "decisions" | "setups" | "research";
+export type DockTab = "positions" | "trades" | "decisions" | "research" | "traders" | "performance" | "evidence" | "dataset";
+export type FeedFilter = "all" | "trades" | "decisions" | "setups" | "research" | "traders";
 
 export type Layout = {
   watchlist: boolean;

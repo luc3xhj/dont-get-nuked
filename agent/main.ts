@@ -17,7 +17,11 @@ import { evidenceReport } from "./evidence";
 import { tregHealth } from "./research";
 import { researchReport } from "./research-report";
 import { control, heldMints, onSignals, portfolioReport, portfolioTick, restorePortfolio, walletSummary } from "./portfolio";
+import { restoreEpisodes, trackEpisodes } from "./episodes";
 import { evaluateSetups } from "./setups";
+import { funnelReport, markVersionStart } from "./funnel";
+import { COLUMNS, evaluatePulse, pulseReport, pulseTick, setFilters, type ColumnId } from "./pulse";
+import { discoverTraders, onTrades, tradersOnCoin, tradersReport, unwatchWallet, watchWallet } from "./traders";
 import {
   coins,
   devHistory,
@@ -30,6 +34,7 @@ import {
   restore,
   stats,
   tapeTick,
+  tradeListeners,
   type CoinState,
 } from "./state";
 
@@ -38,6 +43,8 @@ const lastArmed = new Map<string, number>();
 function evaluate(s: CoinState) {
   s.features = computeFeatures(s);
   s.screens = runScreens(s);
+  // Snipers and bundles become measurable once the launch tape is in.
+  evaluatePulse(s);
   s.setups = evaluateSetups(s, devHistory(s));
   // Note when a setup first arms (once per coin+setup per 10 minutes) for the activity feed.
   for (const x of s.setups) {
@@ -48,7 +55,8 @@ function evaluate(s: CoinState) {
     }
   }
   captureHot(s);
-  const fired = s.setups.filter((x) => x.status === "fire");
+  // Only fires from a live episode count; an expired or invalidated one cools down first.
+  const fired = trackEpisodes(s.coin.mint, s.setups);
   if (fired.length) onSignals(s, fired);
 }
 
@@ -105,6 +113,25 @@ function summary(s: CoinState) {
   };
 }
 
+/** JSON request body, capped at 16 KB. */
+function readJson(req: import("node:http").IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (c) => {
+      raw += c;
+      if (raw.length > 16_384) req.destroy(new Error("Body too large"));
+    });
+    req.on("end", () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        reject(new Error("Invalid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 function send(res: import("node:http").ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(body));
@@ -118,6 +145,37 @@ const server = createServer((req, res) => {
     control(action);
     return send(res, 200, { ok: true });
   }
+  if (url.pathname === "/api/traders") {
+    if (req.method === "GET") return send(res, 200, tradersReport());
+    if (req.method === "POST") {
+      readJson(req)
+        .then((body) => {
+          if (body.action === "remove") {
+            const removed = unwatchWallet(String(body.address ?? ""));
+            return send(res, removed ? 200 : 404, removed ? { ok: true } : { error: "Not on the watchlist" });
+          }
+          const w = watchWallet(body);
+          return "error" in w ? send(res, 400, w) : send(res, 200, w);
+        })
+        .catch((e) => send(res, 400, { error: e instanceof Error ? e.message : "Bad request" }));
+      return;
+    }
+  }
+  if (url.pathname === "/api/pulse") {
+    if (req.method === "GET") return send(res, 200, pulseReport());
+    if (req.method === "POST") {
+      readJson(req)
+        .then((body) => {
+          const col = body.column as ColumnId;
+          if (!COLUMNS.some((c) => c.id === col)) return send(res, 400, { error: "Unknown column" });
+          const f = setFilters(col, body.preset ? "preset" : ((body.filters ?? {}) as Record<string, unknown>));
+          return send(res, 200, f);
+        })
+        .catch((e) => send(res, 400, { error: e instanceof Error ? e.message : "Bad request" }));
+      return;
+    }
+  }
+  if (url.pathname === "/api/funnel") return send(res, 200, funnelReport(Math.min(48, Number(url.searchParams.get("hours")) || 6)));
   if (url.pathname === "/api/portfolio") return send(res, 200, portfolioReport());
   if (url.pathname === "/api/wallet") return send(res, 200, walletSummary());
   if (url.pathname === "/api/dataset") return send(res, 200, datasetSummary());
@@ -172,7 +230,15 @@ const server = createServer((req, res) => {
     const mint = m[1];
     const fills = agentFills(mint);
     const s = coins.get(mint);
-    if (s) return send(res, 200, { ...summary(s), tracked: true, holdersReport: s.holders, recentTrades: s.trades.slice(-60).reverse(), fills });
+    if (s)
+      return send(res, 200, {
+        ...summary(s),
+        tracked: true,
+        holdersReport: s.holders,
+        recentTrades: s.trades.slice(-60).reverse(),
+        fills,
+        traders: tradersOnCoin(s),
+      });
     // No longer watched: still show what we know and what the agent did.
     const c = storedCoin(mint);
     if (!c && !fills.length) return send(res, 404, { error: "Unknown coin" });
@@ -194,6 +260,8 @@ const server = createServer((req, res) => {
 
 restore();
 restorePortfolio();
+restoreEpisodes();
+markVersionStart();
 for (const m of heldMints()) pinned.add(m);
 server.listen(CONFIG.port, "127.0.0.1", () => console.log(`agent API on http://127.0.0.1:${CONFIG.port}`));
 journal("start", null, { config: CONFIG });
@@ -207,6 +275,12 @@ loop("regime", 60_000, async () => regimeTick());
 loop("wallets", 5_000, walletsTick);
 loop("dataset-sample", 20_000, sampleTick);
 loop("dataset-label", 60_000, labelTick);
+tradeListeners.push(onTrades);
+loop("pulse", 3_000, () => pulseTick());
+loop("traders", 10 * 60_000, async () => {
+  const n = discoverTraders();
+  console.log(`[traders] ${n} discovered wallets ranked`);
+});
 // Re-evaluate every hot coin each second so time-based features (windows, exhaustion) stay current between trades.
 loop("evaluate", 1_000, async () => {
   for (const s of coins.values()) if (s.hot) evaluate(s);

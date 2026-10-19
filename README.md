@@ -43,7 +43,7 @@ cp .env.example .env.local  # first setup only; preserve an existing file
 chmod 600 .env.local
 ```
 
-Set `TREG_TOKEN` privately in `.env.local`. Optionally set `CODEX_BIN` to the absolute executable path and `ANALYST_MODEL` to a model available to your login. Without `ANALYST_MODEL`, the isolated run uses the CLI default. The worker allows up to 20 analyst calls/hour (`ANALYST_MAX_PER_HOUR`); these consume your Codex usage allowance.
+Set `TREG_TOKEN` privately in `.env.local`. Optionally set `CODEX_BIN` to the absolute executable path. The analyst explicitly uses `gpt-6.1-sol` by default; `ANALYST_MODEL` can select another model available to your login. There is no automatic fallback to Astra or the CLI default if analysis fails. The worker allows up to 20 analyst calls/hour (`ANALYST_MAX_PER_HOUR`); these consume your Codex usage allowance.
 
 ```bash
 npm run research:check  # live Treg → Codex check; no portfolio writes
